@@ -1,0 +1,15 @@
+version: "3.8"
+services:
+  cisco-eox-finder:
+    image: ghcr.io/bridgenetlab/cisco-eox-finder:latest
+    ports:
+      - "5001:5001"
+    environment:
+      - CISCO_CLIENT_ID=${CISCO_CLIENT_ID}
+      - CISCO_CLIENT_SECRET=${CISCO_CLIENT_SECRET}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5001/')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

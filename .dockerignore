@@ -1,0 +1,25 @@
+# Skills / dev tooling — never ship these
+anthropic-skills/
+skills/
+
+# Secrets — pass as env vars at runtime
+.env
+
+# Git & OS
+.git
+.gitignore
+.DS_Store
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Dev docs
+CLAUDE.md
+workflows/
+
+# Temp
+.tmp/

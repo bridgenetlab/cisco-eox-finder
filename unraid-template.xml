@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>cisco-eox-finder</Name>
+  <Repository>ghcr.io/bridgenetlab/cisco-eox-finder:latest</Repository>
+  <Registry>https://github.com/bridgenetlab/cisco-eox-finder/pkgs/container/cisco-eox-finder</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/bridgenetlab/cisco-eox-finder/issues</Support>
+  <Project>https://github.com/bridgenetlab/cisco-eox-finder</Project>
+  <Overview>Cisco EOX Finder — query Cisco End-of-Life status by Product ID or Serial Number. Supports bulk Excel upload with compliance reporting.</Overview>
+  <Category>Tools:</Category>
+  <WebUI>http://[IP]:[PORT:5001]/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/bridgenetlab/cisco-eox-finder/main/unraid-template.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/bridgenetlab/cisco-eox-finder/main/public/favicon.ico</Icon>
+  <ExtraParams>--restart=unless-stopped</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires/>
+  <Config Name="WebUI Port" Target="5001" Default="5001" Mode="tcp" Description="Port to access the Cisco EOX Finder web interface." Type="Port" Display="always" Required="true" Mask="false">5001</Config>
+  <Config Name="Cisco Client ID" Target="CISCO_CLIENT_ID" Default="" Mode="" Description="Cisco API OAuth2 Client ID." Type="Variable" Display="always" Required="true" Mask="false"></Config>
+  <Config Name="Cisco Client Secret" Target="CISCO_CLIENT_SECRET" Default="" Mode="" Description="Cisco API OAuth2 Client Secret." Type="Variable" Display="always" Required="true" Mask="true"></Config>
+</Container>
