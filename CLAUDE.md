@@ -91,8 +91,8 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 This is the **Cisco EOX Finder** — a tool for querying Cisco's End-of-Life (EOX) and Software Suggestion (SWIM) APIs to surface compliance status for network hardware. It has two interfaces:
 
-1. **CLI** (`tools/cisco_eox.py`, `tools/cisco_swim.py`) — direct terminal lookups by Product ID or Serial Number
-2. **Web App** (`tools/cisco_eox_webapp.py`) — Flask UI with three tabs: Single Search, Bulk Excel Upload, and SWIM
+1. **CLI** (`tools/cisco_eox.py`, `tools/cisco_swim.py`, `tools/cisco_psirt.py`, `tools/cisco_sn2info.py`) — direct terminal lookups by Product ID or Serial Number
+2. **Web App** (`tools/cisco_eox_webapp.py`) — Flask UI with five tabs: Single Search, Bulk Excel Upload, SWIM, PSIRT, and Unified Report
 
 The app is containerized and published to GHCR via GitHub Actions. It can be self-hosted on Docker or Unraid.
 
@@ -106,12 +106,14 @@ cisco-eox-finder/
 │   ├── cisco_eox.py          # EOX API client + CLI entry point
 │   ├── cisco_swim.py         # SWIM API client + CLI entry point
 │   ├── cisco_psirt.py        # PSIRT openVuln API client + CLI entry point
-│   ├── cisco_eox_webapp.py   # Flask web app (imports cisco_eox + cisco_swim + cisco_psirt)
+│   ├── cisco_sn2info.py      # SN2INFO contract coverage + PID resolution client + CLI
+│   ├── cisco_eox_webapp.py   # Flask web app (imports all four clients above)
 │   └── requirements.txt      # Python dependencies
 ├── workflows/
-│   ├── cisco_eox_lookup.md   # SOP for EOX data retrieval
-│   ├── cisco_swim_lookup.md  # SOP for SWIM software suggestion lookup
-│   └── cisco_psirt_lookup.md # SOP for PSIRT security advisory lookup
+│   ├── cisco_eox_lookup.md      # SOP for EOX data retrieval
+│   ├── cisco_swim_lookup.md     # SOP for SWIM software suggestion lookup
+│   ├── cisco_psirt_lookup.md    # SOP for PSIRT security advisory lookup
+│   └── cisco_sn2info_lookup.md  # SOP for SN2INFO contract coverage + PID resolution
 ├── .github/
 │   └── workflows/
 │       └── docker-publish.yml  # CI/CD: builds and pushes Docker image to GHCR
@@ -317,9 +319,50 @@ python cisco_psirt.py --os-type iosxe --version 16.11.1 --severity Critical
 
 ---
 
+### `tools/cisco_sn2info.py` — SN2INFO API Client
+
+Queries the Cisco SN2INFO v2 API to resolve serial numbers to Product IDs and retrieve contract coverage status.
+
+**Environment variables required:** same as EOX (`CISCO_CLIENT_ID`, `CISCO_CLIENT_SECRET`).
+`get_access_token()` is imported from `cisco_eox` — the token cache is shared.
+
+**Key functions:**
+
+| Function | Purpose |
+|---|---|
+| `get_coverage_summary(sns)` | Batch GET `/coverage/summary/serial_numbers/{SNs}`; returns `{SN_UPPER: coverage_dict}` |
+| `get_pids_from_sns(sns)` | Convenience: resolve SNs to orderable PIDs; returns `{SN_UPPER: pid}` |
+
+**Normalized coverage output:**
+```python
+{
+    "coverage_status":   str,   # "Active" or "Inactive"
+    "coverage_end_date": str,   # YYYY-MM-DD
+    "contract_number":   str,
+    "service_level":     str,   # e.g. "SMARTNET 8X5XNBD"
+    "base_pid":          str,
+    "orderable_pid":     str,   # preferred for SWIM lookup
+}
+```
+
+**CLI usage:**
+```bash
+cd tools
+python cisco_sn2info.py --sn FOC10220LK9
+python cisco_sn2info.py --sn "SN1,SN2,SN3" --json
+```
+
+**API constraints:**
+- Endpoint: `GET /sn2info/v2/coverage/summary/serial_numbers/{SN1,SN2,...}`
+- Batch up to 20 SNs per call (conservative URL length limit)
+- Returns both PID resolution and coverage status in a single call
+- Rate limits: 5 calls/sec · 30 calls/min · 5,000 calls/day
+
+---
+
 ### `tools/cisco_eox_webapp.py` — Flask Web Application
 
-Imports `cisco_eox`, `cisco_swim`, and `cisco_psirt`. Serves a single-page application with four tabs.
+Imports `cisco_eox`, `cisco_swim`, `cisco_psirt`, and `cisco_sn2info`. Serves a single-page application with five tabs.
 
 **Routes:**
 
@@ -336,6 +379,8 @@ Imports `cisco_eox`, `cisco_swim`, and `cisco_psirt`. Serves a single-page appli
 | `/psirt/search` | POST | Single version PSIRT lookup; returns `{result: {...}}` |
 | `/psirt/upload` | POST | Accept `.xlsx`/`.csv`, enrich with PSIRT advisory + compliance data |
 | `/psirt/download/<job_id>` | GET | Stream PSIRT-enriched Excel for download |
+| `/unified/upload` | POST | Accept `.xlsx`/`.csv`, enrich with EOX + Coverage + SWIM + PSIRT data |
+| `/unified/download/<job_id>` | GET | Stream unified report Excel for download |
 
 **EOX bulk upload behavior:**
 1. Reads file (`.xlsx`/`.xls`/`.csv`) into a Pandas DataFrame (all columns as strings)
@@ -365,6 +410,17 @@ Imports `cisco_eox`, `cisco_swim`, and `cisco_psirt`. Serves a single-page appli
 7. Rows with no version value get `PSIRT Compliance = NA`
 8. Stores enriched DataFrame in the shared SQLite job store
 
+**Unified Report bulk upload behavior:**
+1. Reads file (`.xlsx`/`.xls`/`.csv`) into a Pandas DataFrame (all columns as strings)
+2. Auto-detects PID column, SN column, version column, and OS Type column
+3. **Requires at least a PID or SN column** — returns `needs_mapping` (context: `"unified"`) if neither found
+4. Runs all four lookups in sequence: EOX → Coverage (SN2INFO) → SWIM → PSIRT
+5. For SWIM when no PID column: uses `orderable_pid` resolved from SN2INFO coverage lookup
+6. Appends 18 new columns total: 7 EOX + 4 Coverage + 3 SWIM + 4 PSIRT
+7. Coverage columns populated only when SN column is present
+8. Rows without a version value get `PSIRT Compliance = NA`
+9. Stores enriched DataFrame in the shared SQLite job store
+
 **Starting the web app:**
 ```bash
 cd tools
@@ -387,6 +443,15 @@ The SOP for any EOX data retrieval task. Always read this before querying. Key s
 - Pagination instructions for wildcard queries
 - Edge cases: invalid PIDs, missing records, token expiry, rate limits
 - Self-improvement log (append discoveries here)
+
+### `workflows/cisco_sn2info_lookup.md`
+
+The SOP for serial number → PID resolution and contract coverage lookups. Key sections:
+- Coverage status definitions (Active / Inactive)
+- CLI usage
+- Web App usage via the Unified Report tab
+- Expected output fields (coverage_status, orderable_pid, etc.)
+- API constraints (batch size 20, pagination, rate limits)
 
 ---
 

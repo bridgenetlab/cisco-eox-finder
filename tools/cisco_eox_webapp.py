@@ -23,6 +23,7 @@ from flask import Flask, jsonify, render_template_string, request, send_file
 sys.path.insert(0, str(Path(__file__).parent))
 import cisco_eox
 import cisco_psirt
+import cisco_sn2info
 import cisco_swim
 
 app = Flask(__name__)
@@ -103,6 +104,14 @@ PSIRT_COLS = [
     ("PSIRT CVEs",               "cves"),
 ]
 
+# ── Contract coverage columns (SN2INFO) ──────────────────────────────────────
+COVERAGE_COLS = [
+    ("Coverage Status",   "coverage_status"),
+    ("Coverage End Date", "coverage_end_date"),
+    ("Contract Number",   "contract_number"),
+    ("Service Level",     "service_level"),
+]
+
 # ── Batched lookups ──────────────────────────────────────────────────────────
 def _build_pid_lookup(pids: list[str]) -> dict[str, dict]:
     """Query EOX API for a list of unique PIDs (batched 20 at a time)."""
@@ -163,6 +172,22 @@ def _build_psirt_lookup(
         except Exception as exc:
             print(f"PSIRT lookup failed for {os_type}/{version}: {exc}", file=sys.stderr)
             lookup[key] = {}
+    return lookup
+
+
+def _build_coverage_lookup(sns: list[str]) -> dict[str, dict]:
+    """Query SN2INFO coverage/summary for unique SNs (batched 20 at a time)."""
+    lookup: dict[str, dict] = {}
+    batch_size = 20
+    for i in range(0, len(sns), batch_size):
+        batch = [s for s in sns[i:i + batch_size] if s]
+        if not batch:
+            continue
+        try:
+            result = cisco_sn2info.get_coverage_summary(batch)
+            lookup.update(result)
+        except Exception as exc:
+            print(f"Coverage lookup failed for batch starting {batch[0]}: {exc}", file=sys.stderr)
     return lookup
 
 # ── HTML ─────────────────────────────────────────────────────────────────────
@@ -384,6 +409,11 @@ select:focus { outline: none; border-color: #1f6feb; }
 
 /* Compliance chart */
 #bulkChartWrap { max-width: 300px; margin: 0 auto 1.5rem; display: none; }
+
+/* Unified table column-type colours */
+thead th.cov-col   { color: #3fb950; }
+thead th.swim-col  { color: #e3b341; }
+thead th.psirt-col { color: #f85149; }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 </head>
@@ -399,6 +429,7 @@ select:focus { outline: none; border-color: #1f6feb; }
   <button class="tab-btn" data-tab="bulk">Bulk Excel Upload</button>
   <button class="tab-btn" data-tab="swim">SWIM</button>
   <button class="tab-btn" data-tab="psirt">PSIRT</button>
+  <button class="tab-btn" data-tab="unified">Unified Report</button>
 </div>
 
 <!-- ── Single Search ── -->
@@ -656,6 +687,72 @@ select:focus { outline: none; border-color: #1f6feb; }
   <div id="psirtTableWrap" class="table-wrap" style="display:none">
     <table id="psirtTable"><thead id="psirtThead"></thead><tbody id="psirtTbody"></tbody></table>
     <div class="pagination" id="psirtPagination"></div>
+  </div>
+</div>
+
+<!-- ── Unified Report Tab ─────────────────────────────────────────────────── -->
+<div id="tab-unified" class="tab-panel">
+  <div class="card">
+    <h2>Unified Report — EOX + Coverage + SWIM + PSIRT</h2>
+    <p style="font-size:0.85rem;color:#8b949e;margin:0 0 1rem">Upload one spreadsheet to enrich it with all four data sources at once.</p>
+    <div class="drop-zone" id="unifiedDropZone">
+      <div class="drop-icon">📋</div>
+      <p>Drag &amp; drop your Excel file here, or click to browse</p>
+      <p style="font-size:0.75rem;color:#6e7681">.xlsx / .csv · needs at least a PID or Serial Number column</p>
+      <input type="file" id="unifiedFileInput" accept=".xlsx,.xls,.csv" style="display:none">
+    </div>
+    <div id="unifiedDetectedCols" style="display:none;margin-bottom:1rem;">
+      <span style="font-size:0.8rem;color:#8b949e">Detected: </span>
+      <span id="unifiedColPid"     style="font-size:0.8rem;color:#3fb950;font-family:monospace"></span>
+      <span id="unifiedColSn"      style="font-size:0.8rem;color:#3fb950;font-family:monospace"></span>
+      <span id="unifiedColVersion" style="font-size:0.8rem;color:#3fb950;font-family:monospace"></span>
+      <span id="unifiedColOsType"  style="font-size:0.8rem;color:#3fb950;font-family:monospace"></span>
+    </div>
+    <div class="progress-wrap" id="unifiedProgressWrap">
+      <div class="progress-bar-bg"><div class="progress-bar-fill" id="unifiedProgressFill" style="width:0%"></div></div>
+      <div class="progress-text" id="unifiedProgressText">Processing…</div>
+    </div>
+    <div id="unifiedColMappingWrap" style="display:none">
+      <p style="font-size:0.85rem;color:#8b949e;margin-bottom:0.75rem">Could not auto-detect a PID or Serial Number column. Select below:</p>
+      <div class="form-row">
+        <div><label>PID / Product ID Column (optional)</label><select id="unifiedManualPidSel"></select></div>
+        <div><label>Serial Number Column (optional)</label><select id="unifiedManualSnSel"></select></div>
+      </div>
+      <div class="form-row">
+        <div><label>Software Version Column (optional)</label><select id="unifiedManualVersionSel"></select></div>
+        <div><label>OS Type Column (optional)</label><select id="unifiedManualOsTypeSel"></select></div>
+      </div>
+      <div style="margin-bottom:0.75rem">
+        <label>Default OS Type (used when no OS Type column)</label>
+        <select id="unifiedDefaultOsTypeSel">
+          <option value="iosxe">IOS XE</option>
+          <option value="ios">IOS</option>
+          <option value="nxos">NX-OS</option>
+          <option value="asa">ASA</option>
+          <option value="ftd">FTD</option>
+          <option value="fxos">FXOS</option>
+          <option value="fmc">FMC</option>
+        </select>
+      </div>
+      <div class="btn-row">
+        <button class="btn-primary" onclick="unifiedResubmitWithMapping()">Process with Selected Columns</button>
+      </div>
+    </div>
+    <div class="btn-row">
+      <button id="unifiedUploadBtn" class="btn-primary" disabled>Process File</button>
+      <button id="unifiedClearUploadBtn" class="btn-secondary">Clear</button>
+      <span id="unifiedUploadStatus" class="status-msg"></span>
+    </div>
+  </div>
+
+  <div id="unifiedSummaryBar"  class="summary-bar"                        style="display:none"></div>
+  <div id="unifiedDownloadBar" style="max-width:1200px;margin:0 auto 1rem;display:none">
+    <a id="unifiedDownloadLink" class="btn-green" href="#">⬇ Download Unified Report</a>
+    <span style="font-size:0.8rem;color:#6e7681;margin-left:0.75rem">Includes all original columns + EOX · Coverage · SWIM · PSIRT data</span>
+  </div>
+  <div id="unifiedTableWrap" class="table-wrap" style="display:none">
+    <table id="unifiedTable"><thead id="unifiedThead"></thead><tbody id="unifiedTbody"></tbody></table>
+    <div class="pagination" id="unifiedPagination"></div>
   </div>
 </div>
 
@@ -1559,6 +1656,224 @@ function renderPsirtPagination() {
   if (psirtPage < pages) html += `<button class="page-btn" onclick="renderPsirtPage(${psirtPage+1})">Next ›</button>`;
   pg.innerHTML = html;
 }
+
+// ── Unified Bulk Upload ───────────────────────────────────────────────────────
+let unifiedRows    = [];
+let unifiedHeaders = [];
+let unifiedColMeta = {};   // {eox:[...], cov:[...], swim:[...], psirt:[...]}
+let unifiedPage    = 1;
+
+const unifiedDropZone     = document.getElementById('unifiedDropZone');
+const unifiedFileInput    = document.getElementById('unifiedFileInput');
+const unifiedUploadBtn    = document.getElementById('unifiedUploadBtn');
+const unifiedUploadStatus = document.getElementById('unifiedUploadStatus');
+const unifiedProgressWrap = document.getElementById('unifiedProgressWrap');
+const unifiedProgressFill = document.getElementById('unifiedProgressFill');
+const unifiedProgressText = document.getElementById('unifiedProgressText');
+
+unifiedDropZone.addEventListener('click', () => unifiedFileInput.click());
+unifiedDropZone.addEventListener('dragover', e => { e.preventDefault(); unifiedDropZone.classList.add('dragover'); });
+unifiedDropZone.addEventListener('dragleave', () => unifiedDropZone.classList.remove('dragover'));
+unifiedDropZone.addEventListener('drop', e => {
+  e.preventDefault(); unifiedDropZone.classList.remove('dragover');
+  if (e.dataTransfer.files[0]) setUnifiedFile(e.dataTransfer.files[0]);
+});
+unifiedFileInput.addEventListener('change', () => { if (unifiedFileInput.files[0]) setUnifiedFile(unifiedFileInput.files[0]); });
+
+function setUnifiedFile(f) {
+  unifiedDropZone.querySelector('p').textContent = `Selected: ${f.name} (${(f.size/1024).toFixed(0)} KB)`;
+  unifiedUploadBtn.disabled = false;
+  unifiedUploadStatus.textContent = '';
+  document.getElementById('unifiedDetectedCols').style.display = 'none';
+}
+
+document.getElementById('unifiedClearUploadBtn').addEventListener('click', () => {
+  unifiedFileInput.value = '';
+  unifiedDropZone.querySelector('p').textContent = 'Drag & drop your Excel file here, or click to browse';
+  unifiedUploadBtn.disabled = true;
+  unifiedUploadStatus.textContent = '';
+  document.getElementById('unifiedDetectedCols').style.display    = 'none';
+  document.getElementById('unifiedColMappingWrap').style.display  = 'none';
+  document.getElementById('unifiedSummaryBar').style.display      = 'none';
+  document.getElementById('unifiedDownloadBar').style.display     = 'none';
+  document.getElementById('unifiedTableWrap').style.display       = 'none';
+  unifiedProgressWrap.style.display = 'none';
+  unifiedRows = []; unifiedHeaders = []; unifiedColMeta = {};
+});
+
+function setUnifiedProgress(pct, msg) {
+  unifiedProgressWrap.style.display = 'block';
+  unifiedProgressFill.style.width = pct + '%';
+  unifiedProgressText.textContent = msg;
+}
+
+unifiedUploadBtn.addEventListener('click', () => doUnifiedUpload());
+
+async function doUnifiedUpload(extraFields = {}) {
+  const f = unifiedFileInput.files[0];
+  if (!f) return;
+  unifiedUploadBtn.disabled = true;
+  unifiedUploadStatus.textContent = '';
+  document.getElementById('unifiedColMappingWrap').style.display = 'none';
+  setUnifiedProgress(10, 'Uploading file…');
+
+  const fd = new FormData();
+  fd.append('file', f);
+  for (const [k, v] of Object.entries(extraFields)) fd.append(k, v);
+
+  try {
+    setUnifiedProgress(25, 'Running EOX + Coverage + SWIM + PSIRT lookups — this may take a moment…');
+    const resp = await fetch('/unified/upload', { method: 'POST', body: fd });
+    const data = await resp.json();
+
+    if (data.needs_mapping && data.context === 'unified') {
+      unifiedProgressWrap.style.display = 'none';
+      const makeOpts = () => '<option value="">-- None --</option>' +
+        data.available_columns.map(c => `<option value="${c.replace(/"/g,'&quot;')}">${c}</option>`).join('');
+      document.getElementById('unifiedManualPidSel').innerHTML     = makeOpts();
+      document.getElementById('unifiedManualSnSel').innerHTML      = makeOpts();
+      document.getElementById('unifiedManualVersionSel').innerHTML = makeOpts();
+      document.getElementById('unifiedManualOsTypeSel').innerHTML  = makeOpts();
+      document.getElementById('unifiedColMappingWrap').style.display = 'block';
+      return;
+    }
+    if (!resp.ok) {
+      unifiedUploadStatus.textContent = 'Error: ' + (data.error || 'Unknown');
+      unifiedProgressWrap.style.display = 'none';
+      return;
+    }
+
+    setUnifiedProgress(100, `Done — ${data.stats.total} rows processed`);
+
+    const dc = document.getElementById('unifiedDetectedCols');
+    document.getElementById('unifiedColPid').textContent     = data.pid_col     ? `PID: "${data.pid_col}" · `      : '';
+    document.getElementById('unifiedColSn').textContent      = data.sn_col      ? `SN: "${data.sn_col}" · `         : '';
+    document.getElementById('unifiedColVersion').textContent = data.version_col ? `Version: "${data.version_col}" · ` : 'Version: none · ';
+    document.getElementById('unifiedColOsType').textContent  = data.os_type_col ? `OS Type: "${data.os_type_col}"` : `OS Type: default (${data.default_os_type})`;
+    dc.style.display = 'block';
+
+    unifiedRows    = data.rows;
+    unifiedHeaders = data.headers;
+    unifiedColMeta = data.col_meta;
+    unifiedPage    = 1;
+
+    renderUnifiedSummary(data.stats);
+    renderUnifiedTable();
+
+    document.getElementById('unifiedDownloadLink').href = `/unified/download/${data.job_id}`;
+    document.getElementById('unifiedDownloadBar').style.display = 'block';
+
+  } catch(err) {
+    unifiedUploadStatus.textContent = 'Error: ' + err.message;
+    unifiedProgressWrap.style.display = 'none';
+  } finally {
+    unifiedUploadBtn.disabled = false;
+  }
+}
+
+function unifiedResubmitWithMapping() {
+  const pidCol        = document.getElementById('unifiedManualPidSel').value;
+  const snCol         = document.getElementById('unifiedManualSnSel').value;
+  const versionCol    = document.getElementById('unifiedManualVersionSel').value;
+  const osTypeCol     = document.getElementById('unifiedManualOsTypeSel').value;
+  const defaultOsType = document.getElementById('unifiedDefaultOsTypeSel').value;
+  if (!pidCol && !snCol) { unifiedUploadStatus.textContent = 'Select at least a PID or Serial Number column.'; return; }
+  const extra = { default_os_type: defaultOsType };
+  if (pidCol)     extra.pid_col      = pidCol;
+  if (snCol)      extra.sn_col       = snCol;
+  if (versionCol) extra.version_col  = versionCol;
+  if (osTypeCol)  extra.os_type_col  = osTypeCol;
+  doUnifiedUpload(extra);
+}
+
+function coverageStatusBadge(label) {
+  if (!label) return '<span class="badge-sm badge-sm-uk">Unknown</span>';
+  const l = label.toLowerCase();
+  if (l === 'active')   return `<span class="badge-sm badge-sm-c">${label}</span>`;
+  if (l === 'inactive') return `<span class="badge-sm badge-sm-nc">${label}</span>`;
+  return `<span class="badge-sm badge-sm-uk">${label}</span>`;
+}
+
+function renderUnifiedSummary(s) {
+  const bar = document.getElementById('unifiedSummaryBar');
+  bar.style.display = 'flex';
+  bar.innerHTML = `
+    <span class="pill pill-total">${s.total} Total Rows</span>
+    <span class="pill pill-c">${s.coverage_active} Coverage Active</span>
+    <span class="pill pill-nc">${s.coverage_inactive} Inactive</span>
+    <span class="pill pill-uk">${s.coverage_unknown} Unknown</span>
+    <span class="pill pill-c">${s.psirt_compliant} PSIRT Compliant</span>
+    <span class="pill pill-nc">${s.psirt_non_compliant} Non-Compliant</span>
+    <span class="pill pill-uk">${s.psirt_na} NA</span>`;
+}
+
+function renderUnifiedTable() {
+  document.getElementById('unifiedTableWrap').style.display = 'block';
+  const eoxCols   = unifiedColMeta.eox   || [];
+  const covCols   = unifiedColMeta.cov   || [];
+  const swimCols  = unifiedColMeta.swim  || [];
+  const psirtCols = unifiedColMeta.psirt || [];
+  document.getElementById('unifiedThead').innerHTML =
+    '<tr>' + unifiedHeaders.map(h => {
+      const cls = eoxCols.includes(h)   ? 'eox-col'
+                : covCols.includes(h)   ? 'cov-col'
+                : swimCols.includes(h)  ? 'swim-col'
+                : psirtCols.includes(h) ? 'psirt-col' : '';
+      return `<th class="${cls}">${h}</th>`;
+    }).join('') + '</tr>';
+  renderUnifiedPage(unifiedPage);
+}
+
+function renderUnifiedPage(page) {
+  unifiedPage = page;
+  const start = (page - 1) * PAGE_SIZE;
+  const slice = unifiedRows.slice(start, start + PAGE_SIZE);
+  const eoxCols   = unifiedColMeta.eox   || [];
+  const covCols   = unifiedColMeta.cov   || [];
+  const swimCols  = unifiedColMeta.swim  || [];
+  const psirtCols = unifiedColMeta.psirt || [];
+  document.getElementById('unifiedTbody').innerHTML = slice.map(row =>
+    '<tr>' + unifiedHeaders.map(h => {
+      const v = row[h];
+      const d = (v === null || v === undefined || v === '') ? '' : String(v);
+      if (h === 'EOX Compliance')     return `<td>${eoxComplianceBadge(d)}</td>`;
+      if (h === 'Coverage Status')    return `<td>${coverageStatusBadge(d)}</td>`;
+      if (h === 'SWIM Compliance')    return `<td>${swimComplianceBadge(d)}</td>`;
+      if (h === 'PSIRT Compliance')   return `<td>${psirtComplianceBadge(d)}</td>`;
+      if (eoxCols.includes(h) || covCols.includes(h) || swimCols.includes(h)) {
+        return `<td class="${!d?'na':'mono'}">${d||'N/A'}</td>`;
+      }
+      if (psirtCols.includes(h)) {
+        return `<td class="${!d?'na':'mono'}" title="${d.replace(/"/g,'&quot;')}">${d||'N/A'}</td>`;
+      }
+      return `<td title="${d.replace(/"/g,'&quot;')}">${d}</td>`;
+    }).join('') + '</tr>'
+  ).join('');
+  renderUnifiedPagination();
+}
+
+function eoxComplianceBadge(label) {
+  if (!label) return '<span class="badge-sm badge-sm-uk">Unknown</span>';
+  const l = label.toLowerCase();
+  if (l.includes('compliant') && !l.includes('non')) return `<span class="badge-sm badge-sm-c">${label}</span>`;
+  if (l.includes('non-compliant') || l.includes('noncompliant')) return `<span class="badge-sm badge-sm-nc">${label}</span>`;
+  if (l.includes('warning')) return `<span class="badge-sm badge-sm-w">${label}</span>`;
+  return `<span class="badge-sm badge-sm-uk">${label}</span>`;
+}
+
+function renderUnifiedPagination() {
+  const total = unifiedRows.length;
+  const pages = Math.ceil(total / PAGE_SIZE);
+  const pg = document.getElementById('unifiedPagination');
+  if (pages <= 1) { pg.innerHTML = ''; return; }
+  let html = `<span class="page-info-txt">Rows ${(unifiedPage-1)*PAGE_SIZE+1}–${Math.min(unifiedPage*PAGE_SIZE,total)} of ${total}</span>`;
+  if (unifiedPage > 1) html += `<button class="page-btn" onclick="renderUnifiedPage(${unifiedPage-1})">‹ Prev</button>`;
+  const us = Math.max(1, unifiedPage-3), ue = Math.min(pages, unifiedPage+3);
+  for (let i = us; i <= ue; i++)
+    html += `<button class="page-btn${i===unifiedPage?' active':''}" onclick="renderUnifiedPage(${i})">${i}</button>`;
+  if (unifiedPage < pages) html += `<button class="page-btn" onclick="renderUnifiedPage(${unifiedPage+1})">Next ›</button>`;
+  pg.innerHTML = html;
+}
 </script>
 </body>
 </html>
@@ -1916,6 +2231,212 @@ def psirt_download(job_id: str):
         buf,
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         download_name="cisco_psirt_enriched.xlsx",
+        as_attachment=True,
+    )
+
+
+@app.route("/unified/upload", methods=["POST"])
+def unified_upload():
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "Empty filename"}), 400
+
+    fname = f.filename.lower()
+    try:
+        df = pd.read_csv(f, dtype=str) if fname.endswith(".csv") else pd.read_excel(f, dtype=str)
+    except Exception as e:
+        return jsonify({"error": f"Could not read file: {e}"}), 400
+    df = df.fillna("")
+
+    PID_KEYWORDS = ["product part", "pid", "part number", "part_no", "model", "pn"]
+    SN_KEYWORDS  = ["serial number", "s/n", "serial_no", "serial"]
+
+    pid_col      = request.form.get("pid_col", "").strip()      or _find_col(df, PID_KEYWORDS)
+    sn_col       = request.form.get("sn_col", "").strip()       or _find_col(df, SN_KEYWORDS)
+    version_col  = request.form.get("version_col", "").strip()  or _find_col(df, SWIM_VERSION_KEYWORDS)
+    os_type_col  = request.form.get("os_type_col", "").strip()  or _find_col(df, OS_TYPE_KEYWORDS)
+    default_os_type = request.form.get("default_os_type", "iosxe").strip().lower()
+
+    if not pid_col and not sn_col:
+        return jsonify({"needs_mapping": True, "available_columns": list(df.columns), "context": "unified"})
+
+    # ── EOX lookup ────────────────────────────────────────────────────────────
+    unique_pids = list(dict.fromkeys(
+        str(row[pid_col]).strip().upper() for _, row in df.iterrows()
+        if pid_col and str(row[pid_col]).strip()
+    ))
+    unique_sns = list(dict.fromkeys(
+        str(row[sn_col]).strip().upper() for _, row in df.iterrows()
+        if sn_col and str(row[sn_col]).strip()
+    ))
+
+    try:
+        pid_lookup = _build_pid_lookup(unique_pids) if unique_pids else {}
+        sn_lookup  = _build_sn_lookup(unique_sns)   if unique_sns  else {}
+    except Exception as e:
+        return jsonify({"error": f"EOX API error: {e}"}), 502
+
+    # ── Coverage lookup (SN2INFO) ─────────────────────────────────────────────
+    try:
+        coverage_lookup = _build_coverage_lookup(unique_sns) if unique_sns else {}
+    except Exception as e:
+        return jsonify({"error": f"Coverage API error: {e}"}), 502
+
+    # ── SWIM lookup — use resolved orderable_pid when no pid_col ──────────────
+    swim_pids: list[str] = []
+    for _, row in df.iterrows():
+        if pid_col:
+            p = str(row[pid_col]).strip().upper()
+            if p:
+                swim_pids.append(p)
+        elif sn_col:
+            sn = str(row[sn_col]).strip().upper()
+            cov = coverage_lookup.get(sn) or {}
+            p = (cov.get("orderable_pid") or cov.get("base_pid") or "").upper()
+            if p:
+                swim_pids.append(p)
+
+    unique_swim_pids = list(dict.fromkeys(swim_pids))
+    try:
+        swim_lookup = _build_swim_lookup(unique_swim_pids) if unique_swim_pids else {}
+    except Exception as e:
+        return jsonify({"error": f"SWIM API error: {e}"}), 502
+
+    # ── PSIRT lookup ──────────────────────────────────────────────────────────
+    psirt_pairs: list[tuple[str, str]] = []
+    if version_col:
+        for _, row in df.iterrows():
+            ver = str(row[version_col]).strip()
+            if not ver:
+                continue
+            ost = str(row[os_type_col]).strip().lower() if os_type_col else default_os_type
+            if not ost or ost not in cisco_psirt.OS_TYPES:
+                ost = default_os_type
+            psirt_pairs.append((ost, ver))
+
+    unique_psirt_pairs = list(dict.fromkeys(psirt_pairs))
+    try:
+        psirt_lookup = _build_psirt_lookup(unique_psirt_pairs) if unique_psirt_pairs else {}
+    except Exception as e:
+        return jsonify({"error": f"PSIRT API error: {e}"}), 502
+
+    # ── Add enriched columns ─────────────────────────────────────────────────
+    eox_col_names   = [c[0] for c in EOX_COLS]
+    cov_col_names   = [c[0] for c in COVERAGE_COLS]
+    swim_col_names  = [c[0] for c in SWIM_COLS]
+    psirt_col_names = [c[0] for c in PSIRT_COLS]
+
+    for name in eox_col_names + cov_col_names + swim_col_names + psirt_col_names:
+        df[name] = ""
+
+    for idx, row in df.iterrows():
+        # Resolve EOX record (pid_col first, else sn_col)
+        eox_rec = {}
+        if pid_col:
+            p = str(row[pid_col]).strip().upper()
+            eox_rec = pid_lookup.get(p) or {}
+        elif sn_col:
+            sn = str(row[sn_col]).strip().upper()
+            eox_rec = sn_lookup.get(sn) or {}
+
+        comp = eox_rec.get("compliance") or {}
+        df.at[idx, "EOX End of Sale"]             = eox_rec.get("end_of_sale", "")
+        df.at[idx, "EOX End of SW Maintenance"]   = eox_rec.get("end_of_sw_maintenance", "")
+        df.at[idx, "EOX End of Security Support"] = eox_rec.get("end_of_security_support", "")
+        df.at[idx, "EOX End of Service Contract"] = eox_rec.get("end_of_service_contract", "")
+        df.at[idx, "EOX Last Date of Support"]    = eox_rec.get("last_date_of_support", "")
+        df.at[idx, "EOX Compliance"]              = comp.get("label", "")
+        df.at[idx, "EOX Migration PID"]           = eox_rec.get("migration_product_id", "")
+
+        # Coverage
+        cov_rec = {}
+        if sn_col:
+            sn = str(row[sn_col]).strip().upper()
+            cov_rec = coverage_lookup.get(sn) or {}
+        df.at[idx, "Coverage Status"]   = cov_rec.get("coverage_status", "")
+        df.at[idx, "Coverage End Date"] = cov_rec.get("coverage_end_date", "")
+        df.at[idx, "Contract Number"]   = cov_rec.get("contract_number", "")
+        df.at[idx, "Service Level"]     = cov_rec.get("service_level", "")
+
+        # SWIM — resolve effective PID
+        swim_pid = ""
+        if pid_col:
+            swim_pid = str(row[pid_col]).strip().upper()
+        elif sn_col:
+            sn = str(row[sn_col]).strip().upper()
+            swim_pid = (cov_rec.get("orderable_pid") or cov_rec.get("base_pid") or "").upper()
+
+        swim_rec = swim_lookup.get(swim_pid) or {} if swim_pid else {}
+        df.at[idx, "SWIM Suggested Release"] = swim_rec.get("suggested_release", "")
+        df.at[idx, "SWIM Lifecycle"]         = swim_rec.get("lifecycle", "")
+        df.at[idx, "SWIM Compliance"]        = swim_rec.get("swim_compliance", "")
+
+        # PSIRT
+        if version_col:
+            ver = str(row[version_col]).strip()
+            if not ver:
+                df.at[idx, "PSIRT Compliance"] = "NA"
+            else:
+                ost = str(row[os_type_col]).strip().lower() if os_type_col else default_os_type
+                if not ost or ost not in cisco_psirt.OS_TYPES:
+                    ost = default_os_type
+                prec = psirt_lookup.get((ost, ver.lower())) or {}
+                df.at[idx, "PSIRT Compliance"]          = prec.get("compliance", "")
+                df.at[idx, "PSIRT Critical Advisories"] = str(prec.get("critical_count", "")) if prec else ""
+                df.at[idx, "PSIRT Advisory IDs"]        = prec.get("advisory_ids", "")
+                df.at[idx, "PSIRT CVEs"]                = prec.get("cves", "")
+        else:
+            df.at[idx, "PSIRT Compliance"] = "NA"
+
+    # ── Stats ─────────────────────────────────────────────────────────────────
+    cov_col  = df["Coverage Status"]
+    psirt_col = df["PSIRT Compliance"]
+    stats = {
+        "total":              len(df),
+        "coverage_active":   int((cov_col == "Active").sum()),
+        "coverage_inactive": int((cov_col == "Inactive").sum()),
+        "coverage_unknown":  int(((cov_col == "") | (cov_col.isna())).sum()),
+        "psirt_compliant":    int((psirt_col == "Compliant").sum()),
+        "psirt_non_compliant": int((psirt_col == "Non-Compliant").sum()),
+        "psirt_na":           int(((psirt_col == "NA") | (psirt_col == "")).sum()),
+    }
+
+    job_id = str(uuid.uuid4())[:8]
+    _store_job(job_id, df)
+
+    return jsonify({
+        "job_id":          job_id,
+        "pid_col":         pid_col,
+        "sn_col":          sn_col,
+        "version_col":     version_col,
+        "os_type_col":     os_type_col,
+        "default_os_type": default_os_type,
+        "headers":         list(df.columns),
+        "col_meta": {
+            "eox":   eox_col_names,
+            "cov":   cov_col_names,
+            "swim":  swim_col_names,
+            "psirt": psirt_col_names,
+        },
+        "rows":  df.to_dict(orient="records"),
+        "stats": stats,
+    })
+
+
+@app.route("/unified/download/<job_id>")
+def unified_download(job_id: str):
+    df = _load_job(job_id)
+    if df is None:
+        return "Job not found or expired", 404
+    buf = io.BytesIO()
+    df.to_excel(buf, index=False, engine="openpyxl")
+    buf.seek(0)
+    return send_file(
+        buf,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        download_name="cisco_unified_report.xlsx",
         as_attachment=True,
     )
 
