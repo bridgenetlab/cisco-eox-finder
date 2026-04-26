@@ -7,9 +7,10 @@ services:
     environment:
       - CISCO_CLIENT_ID=${CISCO_CLIENT_ID}
       - CISCO_CLIENT_SECRET=${CISCO_CLIENT_SECRET}
+      - EOX_WARN_DAYS=${EOX_WARN_DAYS:-180}
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5001/')"]
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5001/health')"]
       interval: 30s
       timeout: 5s
       retries: 3

@@ -10,7 +10,10 @@ Run:
 """
 
 import io
+import pickle
+import sqlite3
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -23,8 +26,34 @@ import cisco_eox
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB
 
-# In-memory job store: job_id -> enriched DataFrame
-_jobs: dict = {}
+# ── SQLite job store ─────────────────────────────────────────────────────────
+_DB_PATH = Path(__file__).parent / "eox_jobs.db"
+_JOB_TTL = 86400  # 24 hours
+
+
+def _db():
+    conn = sqlite3.connect(_DB_PATH)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS jobs "
+        "(job_id TEXT PRIMARY KEY, data BLOB NOT NULL, created_at INTEGER NOT NULL)"
+    )
+    conn.commit()
+    return conn
+
+
+def _store_job(job_id: str, df: pd.DataFrame) -> None:
+    with _db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO jobs (job_id, data, created_at) VALUES (?, ?, ?)",
+            (job_id, pickle.dumps(df), int(time.time())),
+        )
+        conn.execute("DELETE FROM jobs WHERE created_at < ?", (int(time.time()) - _JOB_TTL,))
+
+
+def _load_job(job_id: str) -> pd.DataFrame | None:
+    with _db() as conn:
+        row = conn.execute("SELECT data FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+    return pickle.loads(row[0]) if row else None
 
 # ── Column-name detection ────────────────────────────────────────────────────
 PID_KEYWORDS = ["product part", "product_part", "productpart", "pid",
@@ -274,7 +303,33 @@ td.na { color: #484f58; font-style: italic; }
 .spinner { display: inline-block; width: 18px; height: 18px; border: 2px solid #30363d; border-top-color: #1f6feb; border-radius: 50%; animation: spin 0.6s linear infinite; margin-right: 0.5rem; vertical-align: middle; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .no-results { text-align: center; color: #6e7681; padding: 2rem; font-size: 0.9rem; }
+
+/* Search history */
+#searchHistory { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.75rem; align-items: center; }
+.history-chip {
+  padding: 0.25rem 0.75rem; background: rgba(88,166,255,0.08); color: #58a6ff;
+  border: 1px solid rgba(88,166,255,0.25); border-radius: 20px;
+  font-size: 0.75rem; font-family: "SF Mono","Fira Code",monospace; cursor: pointer;
+}
+.history-chip:hover { background: rgba(88,166,255,0.18); }
+
+/* Column mapping */
+#colMappingWrap {
+  background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
+  padding: 1rem; margin-bottom: 1rem;
+}
+#colMappingWrap p { font-size: 0.85rem; color: #8b949e; margin-bottom: 0.75rem; }
+select {
+  width: 100%; padding: 0.6rem 0.75rem; background: #0d1117;
+  border: 1px solid #30363d; border-radius: 6px; color: #e6edf3;
+  font-size: 0.9rem; cursor: pointer;
+}
+select:focus { outline: none; border-color: #1f6feb; }
+
+/* Compliance chart */
+#bulkChartWrap { max-width: 300px; margin: 0 auto 1.5rem; display: none; }
 </style>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 </head>
 <body>
 
@@ -310,6 +365,7 @@ td.na { color: #484f58; font-style: italic; }
         <button type="button" id="clearBtn" class="btn-secondary">Clear</button>
         <span id="searchStatus" class="status-msg"></span>
       </div>
+      <div id="searchHistory"></div>
     </form>
   </div>
   <div id="results"></div>
@@ -339,6 +395,23 @@ td.na { color: #484f58; font-style: italic; }
       <div class="progress-text" id="progressText">Processing…</div>
     </div>
 
+    <div id="colMappingWrap" style="display:none">
+      <p>Could not auto-detect columns. Select the correct ones below:</p>
+      <div class="form-row">
+        <div>
+          <label>Product ID Column</label>
+          <select id="manualPidSel"></select>
+        </div>
+        <div>
+          <label>Serial Number Column</label>
+          <select id="manualSnSel"></select>
+        </div>
+      </div>
+      <div class="btn-row" style="margin-top:0.75rem">
+        <button class="btn-primary" onclick="resubmitWithMapping()">Process with Selected Columns</button>
+      </div>
+    </div>
+
     <div class="btn-row">
       <button id="uploadBtn" class="btn-primary" disabled>Process File</button>
       <button id="clearUploadBtn" class="btn-secondary">Clear</button>
@@ -346,8 +419,9 @@ td.na { color: #484f58; font-style: italic; }
     </div>
   </div>
 
-  <!-- Summary + Download -->
+  <!-- Summary + Chart + Download -->
   <div id="bulkSummaryBar" class="summary-bar" style="display:none"></div>
+  <div id="bulkChartWrap"><canvas id="complianceChart"></canvas></div>
 
   <div id="bulkDownloadBar" style="max-width:1200px;margin:0 auto 1rem;display:none">
     <a id="downloadLink" class="btn-green" href="#">⬇ Download Enriched Excel</a>
@@ -403,6 +477,7 @@ searchForm.addEventListener('submit', async e => {
     const data = await resp.json();
     if (!resp.ok) { resultsDiv.innerHTML = `<div class="error-msg">Error: ${data.error || 'Unknown'}</div>`; return; }
     renderSingleResults(data.results);
+    addToHistory(pid, sn);
   } catch(err) {
     resultsDiv.innerHTML = `<div class="error-msg">Network error: ${err.message}</div>`;
   } finally { searchBtn.disabled = false; }
@@ -496,10 +571,13 @@ document.getElementById('clearUploadBtn').addEventListener('click', () => {
   uploadBtn.disabled = true;
   uploadStatus.textContent = '';
   document.getElementById('detectedCols').style.display = 'none';
+  document.getElementById('colMappingWrap').style.display = 'none';
   document.getElementById('bulkSummaryBar').style.display = 'none';
+  document.getElementById('bulkChartWrap').style.display = 'none';
   document.getElementById('bulkDownloadBar').style.display = 'none';
   document.getElementById('bulkTableWrap').style.display = 'none';
   progressWrap.style.display = 'none';
+  if (_chart) { _chart.destroy(); _chart = null; }
   bulkRows = []; bulkHeaders = []; eoxColNames = [];
 });
 
@@ -509,21 +587,37 @@ function setProgress(pct, msg) {
   progressText.textContent = msg;
 }
 
-uploadBtn.addEventListener('click', async () => {
+uploadBtn.addEventListener('click', () => doUpload());
+
+let _chart = null;
+
+async function doUpload(extraFields = {}) {
   const f = fileInput.files[0];
   if (!f) return;
   uploadBtn.disabled = true;
   uploadStatus.textContent = '';
+  document.getElementById('colMappingWrap').style.display = 'none';
   setProgress(10, 'Uploading file…');
 
   const fd = new FormData();
   fd.append('file', f);
+  for (const [k, v] of Object.entries(extraFields)) fd.append(k, v);
 
   try {
-    setProgress(30, 'Parsing Excel and querying EOX API…');
+    setProgress(30, 'Parsing file and querying EOX API…');
     const resp = await fetch('/upload', { method: 'POST', body: fd });
     const data = await resp.json();
-    if (!resp.ok) { uploadStatus.textContent = 'Error: ' + (data.error || 'Unknown'); progressWrap.style.display='none'; return; }
+
+    if (data.needs_mapping) {
+      progressWrap.style.display = 'none';
+      showColMapping(data.available_columns);
+      return;
+    }
+    if (!resp.ok) {
+      uploadStatus.textContent = 'Error: ' + (data.error || 'Unknown');
+      progressWrap.style.display = 'none';
+      return;
+    }
 
     const lookupSummary = [
       data.stats.unique_pids ? `${data.stats.unique_pids} unique PIDs` : '',
@@ -531,7 +625,6 @@ uploadBtn.addEventListener('click', async () => {
     ].filter(Boolean).join(', ');
     setProgress(100, `Done — ${data.stats.total} rows processed (${lookupSummary})`);
 
-    // Show detected columns
     document.getElementById('colPid').textContent = data.pid_col ? `PID: "${data.pid_col}"` : 'PID: not found';
     document.getElementById('colSn').textContent  = data.sn_col  ? `SN: "${data.sn_col}"`   : 'SN: not found';
     document.getElementById('detectedCols').style.display = 'block';
@@ -542,6 +635,7 @@ uploadBtn.addEventListener('click', async () => {
     currentPage = 1;
 
     renderSummary(data.stats);
+    renderChart(data.stats);
     renderBulkTable();
 
     document.getElementById('downloadLink').href = `/download/${data.job_id}`;
@@ -553,7 +647,43 @@ uploadBtn.addEventListener('click', async () => {
   } finally {
     uploadBtn.disabled = false;
   }
-});
+}
+
+function showColMapping(cols) {
+  const makeOpts = () => '<option value="">-- None --</option>' +
+    cols.map(c => `<option value="${c.replace(/"/g,'&quot;')}">${c}</option>`).join('');
+  document.getElementById('manualPidSel').innerHTML = makeOpts();
+  document.getElementById('manualSnSel').innerHTML  = makeOpts();
+  document.getElementById('colMappingWrap').style.display = 'block';
+}
+
+function resubmitWithMapping() {
+  const pidCol = document.getElementById('manualPidSel').value;
+  const snCol  = document.getElementById('manualSnSel').value;
+  if (!pidCol && !snCol) { uploadStatus.textContent = 'Select at least one column.'; return; }
+  const extra = {};
+  if (pidCol) extra.pid_col = pidCol;
+  if (snCol)  extra.sn_col  = snCol;
+  doUpload(extra);
+}
+
+function renderChart(s) {
+  document.getElementById('bulkChartWrap').style.display = 'block';
+  const ctx = document.getElementById('complianceChart').getContext('2d');
+  if (_chart) { _chart.destroy(); _chart = null; }
+  _chart = new Chart(ctx, {
+    type: 'doughnut',
+    data: {
+      labels: ['Compliant', 'Warning', 'Noncompliant', 'Unknown'],
+      datasets: [{ data: [s.compliant, s.warning, s.noncompliant, s.unknown],
+        backgroundColor: ['#3fb950', '#e3b341', '#f85149', '#6e7681'], borderWidth: 0 }]
+    },
+    options: {
+      plugins: { legend: { labels: { color: '#8b949e', font: { size: 12 } } } },
+      cutout: '65%',
+    }
+  });
+}
 
 function renderSummary(s) {
   const bar = document.getElementById('bulkSummaryBar');
@@ -633,10 +763,50 @@ function renderPagination() {
   if (currentPage < pages) html += `<button class="page-btn" onclick="renderPage(${currentPage+1})">Next ›</button>`;
   pg.innerHTML = html;
 }
+
+// ── Search history ────────────────────────────────────────────────────────────
+const HISTORY_KEY = 'eox_search_history';
+const MAX_HISTORY = 10;
+
+function addToHistory(pid, sn) {
+  if (!pid && !sn) return;
+  let h = JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]');
+  h = h.filter(e => !(e.pid === pid && e.sn === sn));
+  h.unshift({ pid, sn });
+  localStorage.setItem(HISTORY_KEY, JSON.stringify(h.slice(0, MAX_HISTORY)));
+  renderHistory();
+}
+
+function renderHistory() {
+  const h = JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]');
+  const el = document.getElementById('searchHistory');
+  if (!h.length) { el.innerHTML = ''; return; }
+  el.innerHTML =
+    '<span style="font-size:0.75rem;color:#6e7681;margin-right:0.4rem">Recent:</span>' +
+    h.map((e, i) => {
+      const label = [e.pid, e.sn].filter(Boolean).join(' / ');
+      return `<button class="history-chip" onclick="applyHistory(${i})">${label}</button>`;
+    }).join('');
+}
+
+function applyHistory(i) {
+  const h = JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]');
+  if (!h[i]) return;
+  document.getElementById('pid').value = h[i].pid || '';
+  document.getElementById('sn').value  = h[i].sn  || '';
+  searchForm.dispatchEvent(new Event('submit'));
+}
+
+renderHistory();
 </script>
 </body>
 </html>
 """
+
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"})
 
 
 @app.route("/")
@@ -687,13 +857,12 @@ def upload():
 
     df = df.fillna("")
 
-    # Detect columns
-    pid_col = _find_col(df, PID_KEYWORDS)
-    sn_col  = _find_col(df, SN_KEYWORDS)
+    # Honour manual column overrides from the column-mapping UI
+    pid_col = request.form.get("pid_col", "").strip() or _find_col(df, PID_KEYWORDS)
+    sn_col  = request.form.get("sn_col",  "").strip() or _find_col(df, SN_KEYWORDS)
 
     if not pid_col and not sn_col:
-        return jsonify({"error": "Could not find 'Product Part' or 'Serial Number' column. "
-                                 "Please ensure your Excel has these column headers."}), 400
+        return jsonify({"needs_mapping": True, "available_columns": list(df.columns)})
 
     # Build EOX lookup from unique PIDs and/or SNs
     pid_lookup: dict = {}
@@ -743,9 +912,9 @@ def upload():
         "unknown":      int((compliance_col == "").sum()),
     }
 
-    # Store enriched df for download
+    # Persist enriched df for download
     job_id = str(uuid.uuid4())[:8]
-    _jobs[job_id] = df
+    _store_job(job_id, df)
 
     # Return rows as list of dicts
     rows = df.to_dict(orient="records")
@@ -764,7 +933,7 @@ def upload():
 
 @app.route("/download/<job_id>")
 def download(job_id):
-    df = _jobs.get(job_id)
+    df = _load_job(job_id)
     if df is None:
         return "Job not found or expired", 404
     buf = io.BytesIO()

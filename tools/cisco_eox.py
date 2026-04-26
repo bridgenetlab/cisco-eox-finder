@@ -28,8 +28,8 @@ CLIENT_SECRET = os.getenv("CISCO_CLIENT_SECRET")
 TOKEN_URL = "https://id.cisco.com/oauth2/default/v1/token"
 EOX_BASE_URL = "https://apix.cisco.com/supporttools/eox/rest/5"
 
-# Compliance thresholds (days before last date of support)
-WARN_DAYS = 180
+# Compliance thresholds (days before last date of support). Override via EOX_WARN_DAYS env var.
+WARN_DAYS = int(os.getenv("EOX_WARN_DAYS", "180"))
 
 # In-memory token cache
 _token_cache = {"access_token": None, "expires_at": 0}
@@ -62,20 +62,24 @@ def get_access_token() -> str:
     return _token_cache["access_token"]
 
 
-def _eox_request(endpoint: str) -> dict:
-    """Make authenticated GET request to EOX API and return parsed JSON."""
-    token = get_access_token()
+def _eox_request(endpoint: str, _retries: int = 3) -> dict:
+    """Make authenticated GET request to EOX API, retrying on 429 with backoff."""
     url = f"{EOX_BASE_URL}/{endpoint}"
-    resp = requests.get(
-        url,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-        },
-        timeout=15,
-    )
-    resp.raise_for_status()
-    return resp.json()
+    for attempt in range(_retries + 1):
+        resp = requests.get(
+            url,
+            headers={
+                "Authorization": f"Bearer {get_access_token()}",
+                "Accept": "application/json",
+            },
+            timeout=15,
+        )
+        if resp.status_code == 429 and attempt < _retries:
+            time.sleep(2 ** attempt)
+            continue
+        resp.raise_for_status()
+        return resp.json()
+    resp.raise_for_status()  # unreachable but satisfies type checkers
 
 
 def _compliance_status(last_date_str: str) -> dict:
