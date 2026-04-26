@@ -22,6 +22,7 @@ from flask import Flask, jsonify, render_template_string, request, send_file
 
 sys.path.insert(0, str(Path(__file__).parent))
 import cisco_eox
+import cisco_psirt
 import cisco_swim
 
 app = Flask(__name__)
@@ -92,6 +93,16 @@ SWIM_COLS = [
     ("SWIM Compliance",        "swim_compliance"),
 ]
 
+# ── PSIRT columns and OS-type-column detection ───────────────────────────────
+OS_TYPE_KEYWORDS = ["os type", "os_type", "software type", "software_type", "platform"]
+
+PSIRT_COLS = [
+    ("PSIRT Compliance",          "compliance"),
+    ("PSIRT Critical Advisories", "critical_count"),
+    ("PSIRT Advisory IDs",        "advisory_ids"),
+    ("PSIRT CVEs",               "cves"),
+]
+
 # ── Batched lookups ──────────────────────────────────────────────────────────
 def _build_pid_lookup(pids: list[str]) -> dict[str, dict]:
     """Query EOX API for a list of unique PIDs (batched 20 at a time)."""
@@ -134,6 +145,24 @@ def _build_swim_lookup(pids: list[str]) -> dict[str, dict]:
         except Exception as exc:
             print(f"SWIM lookup failed for {pid}: {exc}", file=sys.stderr)
             lookup[pid.upper()] = {}
+    return lookup
+
+
+def _build_psirt_lookup(
+    pairs: list[tuple[str, str]],
+) -> dict[tuple[str, str], dict]:
+    """Query PSIRT API for unique (os_type, version) pairs one at a time."""
+    lookup: dict[tuple[str, str], dict] = {}
+    for os_type, version in pairs:
+        key = (os_type.lower(), version.lower())
+        if key in lookup:
+            continue
+        try:
+            rec = cisco_psirt.get_psirt_summary(os_type, version)
+            lookup[key] = rec or {}
+        except Exception as exc:
+            print(f"PSIRT lookup failed for {os_type}/{version}: {exc}", file=sys.stderr)
+            lookup[key] = {}
     return lookup
 
 # ── HTML ─────────────────────────────────────────────────────────────────────
@@ -362,13 +391,14 @@ select:focus { outline: none; border-color: #1f6feb; }
 
 <header>
   <div class="logo">Cisco <span>EOX</span> Finder</div>
-  <p>End-of-Life compliance · Software Image Management — Cisco APIs</p>
+  <p>End-of-Life · SWIM · PSIRT Security — Cisco APIs</p>
 </header>
 
 <div class="tabs">
   <button class="tab-btn active" data-tab="single">Single Search</button>
   <button class="tab-btn" data-tab="bulk">Bulk Excel Upload</button>
   <button class="tab-btn" data-tab="swim">SWIM</button>
+  <button class="tab-btn" data-tab="psirt">PSIRT</button>
 </div>
 
 <!-- ── Single Search ── -->
@@ -532,6 +562,100 @@ select:focus { outline: none; border-color: #1f6feb; }
   <div id="swimTableWrap" class="table-wrap" style="display:none">
     <table id="swimTable"><thead id="swimThead"></thead><tbody id="swimTbody"></tbody></table>
     <div class="pagination" id="swimPagination"></div>
+  </div>
+</div>
+
+<!-- ── PSIRT Tab ── -->
+<div id="tab-psirt" class="tab-panel">
+
+  <!-- Single search -->
+  <div class="card">
+    <h2>PSIRT — Security Advisory Lookup</h2>
+    <form id="psirtSearchForm">
+      <div class="form-row">
+        <div>
+          <label for="psirtOsType">OS Type</label>
+          <select id="psirtOsType">
+            <option value="iosxe">IOS XE</option>
+            <option value="ios">IOS</option>
+            <option value="nxos">NX-OS</option>
+            <option value="asa">ASA</option>
+            <option value="ftd">FTD</option>
+            <option value="fxos">FXOS</option>
+            <option value="fmc">FMC</option>
+          </select>
+        </div>
+        <div>
+          <label for="psirtVersion">Software Version</label>
+          <input type="text" id="psirtVersion" placeholder="e.g. 16.11.1" autocomplete="off">
+          <div class="hint">Exact version string as reported by the device</div>
+        </div>
+      </div>
+      <div class="btn-row">
+        <button type="submit" id="psirtSearchBtn" class="btn-primary">Check Advisories</button>
+        <button type="button" id="psirtClearBtn" class="btn-secondary">Clear</button>
+        <span id="psirtSearchStatus" class="status-msg"></span>
+      </div>
+    </form>
+  </div>
+  <div id="psirtResults"></div>
+
+  <!-- Bulk upload -->
+  <div class="card">
+    <h2>PSIRT Bulk Upload</h2>
+    <div class="drop-zone" id="psirtDropZone">
+      <div class="drop-icon">🔐</div>
+      <p>Drag &amp; drop your Excel file here, or click to browse</p>
+      <p style="font-size:0.75rem;color:#6e7681">.xlsx / .csv · detects "Current Version" and optionally "OS Type" columns</p>
+      <input type="file" id="psirtFileInput" accept=".xlsx,.xls,.csv" style="display:none">
+    </div>
+    <div id="psirtDetectedCols" style="display:none;margin-bottom:1rem;">
+      <span style="font-size:0.8rem;color:#8b949e">Detected columns: </span>
+      <span id="psirtColVersion" style="font-size:0.8rem;color:#3fb950;font-family:monospace"></span>
+      <span style="font-size:0.8rem;color:#6e7681"> · </span>
+      <span id="psirtColOsType" style="font-size:0.8rem;color:#3fb950;font-family:monospace"></span>
+    </div>
+    <div class="progress-wrap" id="psirtProgressWrap">
+      <div class="progress-bar-bg"><div class="progress-bar-fill" id="psirtProgressFill" style="width:0%"></div></div>
+      <div class="progress-text" id="psirtProgressText">Processing…</div>
+    </div>
+    <div id="psirtColMappingWrap" style="display:none">
+      <p style="font-size:0.85rem;color:#8b949e;margin-bottom:0.75rem">Could not auto-detect version column. Select below:</p>
+      <div class="form-row">
+        <div><label>Software Version Column</label><select id="psirtManualVersionSel"></select></div>
+        <div><label>OS Type Column (optional)</label><select id="psirtManualOsTypeSel"></select></div>
+      </div>
+      <div style="margin-bottom:0.75rem">
+        <label>Default OS Type (used when no OS Type column)</label>
+        <select id="psirtDefaultOsTypeSel">
+          <option value="iosxe">IOS XE</option>
+          <option value="ios">IOS</option>
+          <option value="nxos">NX-OS</option>
+          <option value="asa">ASA</option>
+          <option value="ftd">FTD</option>
+          <option value="fxos">FXOS</option>
+          <option value="fmc">FMC</option>
+        </select>
+      </div>
+      <div class="btn-row">
+        <button class="btn-primary" onclick="psirtResubmitWithMapping()">Process with Selected Columns</button>
+      </div>
+    </div>
+    <div class="btn-row">
+      <button id="psirtUploadBtn" class="btn-primary" disabled>Process File</button>
+      <button id="psirtClearUploadBtn" class="btn-secondary">Clear</button>
+      <span id="psirtUploadStatus" class="status-msg"></span>
+    </div>
+  </div>
+
+  <div id="psirtSummaryBar"  class="summary-bar"                        style="display:none"></div>
+  <div id="psirtDownloadBar" style="max-width:1200px;margin:0 auto 1rem;display:none">
+    <a id="psirtDownloadLink" class="btn-green" href="#">⬇ Download Enriched Excel</a>
+    <span style="font-size:0.8rem;color:#6e7681;margin-left:0.75rem">Includes all original columns + PSIRT advisory data</span>
+  </div>
+  <div id="psirtTableWrap" class="table-wrap" style="display:none">
+    <table id="psirtTable"><thead id="psirtThead"></thead><tbody id="psirtTbody"></tbody></table>
+    <div class="pagination" id="psirtPagination"></div>
   </div>
 </div>
 
@@ -1158,6 +1282,283 @@ function renderSwimPagination() {
   if (swimPage < pages) html += `<button class="page-btn" onclick="renderSwimPage(${swimPage+1})">Next ›</button>`;
   pg.innerHTML = html;
 }
+
+// ── PSIRT Single Search ───────────────────────────────────────────────────────
+const psirtSearchForm   = document.getElementById('psirtSearchForm');
+const psirtResultsDiv   = document.getElementById('psirtResults');
+const psirtSearchStatus = document.getElementById('psirtSearchStatus');
+const psirtSearchBtn    = document.getElementById('psirtSearchBtn');
+
+document.getElementById('psirtClearBtn').addEventListener('click', () => {
+  document.getElementById('psirtVersion').value = '';
+  psirtResultsDiv.innerHTML = '';
+  psirtSearchStatus.textContent = '';
+});
+
+psirtSearchForm.addEventListener('submit', async e => {
+  e.preventDefault();
+  const os_type = document.getElementById('psirtOsType').value;
+  const version = document.getElementById('psirtVersion').value.trim();
+  if (!version) { psirtSearchStatus.textContent = 'Enter a software version.'; return; }
+  psirtSearchBtn.disabled = true;
+  psirtSearchStatus.textContent = '';
+  psirtResultsDiv.innerHTML = '<div class="loading"><span class="spinner"></span>Querying PSIRT API…</div>';
+  try {
+    const resp = await fetch('/psirt/search', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({os_type, version}),
+    });
+    const data = await resp.json();
+    if (!resp.ok) { psirtResultsDiv.innerHTML = `<div class="error-msg">Error: ${data.error || 'Unknown'}</div>`; return; }
+    renderPsirtResults(data.result);
+  } catch(err) {
+    psirtResultsDiv.innerHTML = `<div class="error-msg">Network error: ${err.message}</div>`;
+  } finally { psirtSearchBtn.disabled = false; }
+});
+
+function psirtComplianceBadge(label) {
+  if (!label) return '<span class="badge-sm badge-sm-uk">Unknown</span>';
+  const l = label.toLowerCase();
+  if (l === 'compliant')     return `<span class="badge-sm badge-sm-c">${label}</span>`;
+  if (l === 'non-compliant') return `<span class="badge-sm badge-sm-nc">${label}</span>`;
+  return `<span class="badge-sm badge-sm-uk">${label}</span>`;
+}
+
+function psirtSirBadge(sir) {
+  const l = (sir || '').toLowerCase();
+  if (l === 'critical') return `<span class="badge-sm badge-sm-nc">${sir}</span>`;
+  if (l === 'high')     return `<span class="badge-sm badge-sm-w">${sir}</span>`;
+  return `<span class="badge-sm badge-sm-uk">${sir || 'N/A'}</span>`;
+}
+
+function renderPsirtResults(result) {
+  if (!result) { psirtResultsDiv.innerHTML = '<div class="no-results">No result.</div>'; return; }
+  if (result.error) { psirtResultsDiv.innerHTML = `<div class="error-msg">${result.error}</div>`; return; }
+
+  const advs = result.advisories || [];
+  const compClass = result.compliance === 'Non-Compliant' ? 'noncompliant'
+                  : result.compliance === 'Compliant'     ? 'compliant' : 'unknown';
+
+  const sirCounts = {};
+  for (const a of advs) sirCounts[a.sir] = (sirCounts[a.sir] || 0) + 1;
+  const sirSummary = Object.entries(sirCounts)
+    .sort(([a],[b]) => (['Critical','High','Medium','Low'].indexOf(a)) - (['Critical','High','Medium','Low'].indexOf(b)))
+    .map(([s,n]) => `${psirtSirBadge(s)} <span style="font-size:0.8rem;color:#8b949e">&times;${n}</span>`)
+    .join(' &nbsp; ');
+
+  let html = `<div class="eox-card ${compClass}">
+    <div class="eox-top">
+      <div>
+        <div class="eox-pid">${result.os_type.toUpperCase()} ${result.version}</div>
+        <div class="eox-name">${advs.length} advisory${advs.length!==1?'s':''} found</div>
+      </div>
+      <div style="display:flex;flex-direction:column;align-items:flex-end;gap:0.4rem">
+        ${psirtComplianceBadge(result.compliance)}
+        <div style="display:flex;gap:0.4rem;flex-wrap:wrap;justify-content:flex-end">${sirSummary}</div>
+      </div>
+    </div>`;
+
+  if (advs.length) {
+    html += `<div style="overflow-x:auto;margin-top:0.75rem"><table style="width:100%;border-collapse:collapse;font-size:0.78rem">
+      <thead><tr>
+        <th style="text-align:left;padding:0.4rem 0.6rem;color:#8b949e;border-bottom:1px solid #30363d;white-space:nowrap">SIR</th>
+        <th style="text-align:left;padding:0.4rem 0.6rem;color:#8b949e;border-bottom:1px solid #30363d">Title</th>
+        <th style="text-align:left;padding:0.4rem 0.6rem;color:#8b949e;border-bottom:1px solid #30363d;white-space:nowrap">Advisory ID</th>
+        <th style="text-align:left;padding:0.4rem 0.6rem;color:#8b949e;border-bottom:1px solid #30363d;white-space:nowrap">CVSS</th>
+        <th style="text-align:left;padding:0.4rem 0.6rem;color:#8b949e;border-bottom:1px solid #30363d">CVEs</th>
+        <th style="text-align:left;padding:0.4rem 0.6rem;color:#8b949e;border-bottom:1px solid #30363d;white-space:nowrap">Published</th>
+      </tr></thead><tbody>`;
+    for (const a of advs) {
+      const cves = (a.cves || []).join(', ') || 'N/A';
+      const url  = a.publication_url
+        ? `<a href="${a.publication_url}" target="_blank" style="color:#58a6ff;font-family:monospace;font-size:0.78rem">${a.advisory_id}</a>`
+        : `<span style="font-family:monospace">${a.advisory_id}</span>`;
+      html += `<tr style="border-bottom:1px solid #21262d">
+        <td style="padding:0.4rem 0.6rem">${psirtSirBadge(a.sir)}</td>
+        <td style="padding:0.4rem 0.6rem;color:#c9d1d9;max-width:320px;overflow:hidden;text-overflow:ellipsis" title="${a.title.replace(/"/g,'&quot;')}">${a.title}</td>
+        <td style="padding:0.4rem 0.6rem;white-space:nowrap">${url}</td>
+        <td style="padding:0.4rem 0.6rem;color:#8b949e;font-family:monospace">${a.cvss_score || 'N/A'}</td>
+        <td style="padding:0.4rem 0.6rem;color:#8b949e;max-width:200px;overflow:hidden;text-overflow:ellipsis" title="${cves}">${cves}</td>
+        <td style="padding:0.4rem 0.6rem;color:#8b949e;white-space:nowrap;font-family:monospace">${(a.first_published||'').slice(0,10)||'N/A'}</td>
+      </tr>`;
+    }
+    html += '</tbody></table></div>';
+  }
+  html += '</div>';
+  psirtResultsDiv.innerHTML = html;
+}
+
+// ── PSIRT Bulk Upload ─────────────────────────────────────────────────────────
+let psirtRows    = [];
+let psirtHeaders = [];
+let psirtCols    = [];
+let psirtPage    = 1;
+
+const psirtDropZone     = document.getElementById('psirtDropZone');
+const psirtFileInput    = document.getElementById('psirtFileInput');
+const psirtUploadBtn    = document.getElementById('psirtUploadBtn');
+const psirtUploadStatus = document.getElementById('psirtUploadStatus');
+const psirtProgressWrap = document.getElementById('psirtProgressWrap');
+const psirtProgressFill = document.getElementById('psirtProgressFill');
+const psirtProgressText = document.getElementById('psirtProgressText');
+
+psirtDropZone.addEventListener('click', () => psirtFileInput.click());
+psirtDropZone.addEventListener('dragover', e => { e.preventDefault(); psirtDropZone.classList.add('dragover'); });
+psirtDropZone.addEventListener('dragleave', () => psirtDropZone.classList.remove('dragover'));
+psirtDropZone.addEventListener('drop', e => {
+  e.preventDefault(); psirtDropZone.classList.remove('dragover');
+  if (e.dataTransfer.files[0]) setPsirtFile(e.dataTransfer.files[0]);
+});
+psirtFileInput.addEventListener('change', () => { if (psirtFileInput.files[0]) setPsirtFile(psirtFileInput.files[0]); });
+
+function setPsirtFile(f) {
+  psirtDropZone.querySelector('p').textContent = `Selected: ${f.name} (${(f.size/1024).toFixed(0)} KB)`;
+  psirtUploadBtn.disabled = false;
+  psirtUploadStatus.textContent = '';
+  document.getElementById('psirtDetectedCols').style.display = 'none';
+}
+
+document.getElementById('psirtClearUploadBtn').addEventListener('click', () => {
+  psirtFileInput.value = '';
+  psirtDropZone.querySelector('p').textContent = 'Drag & drop your Excel file here, or click to browse';
+  psirtUploadBtn.disabled = true;
+  psirtUploadStatus.textContent = '';
+  document.getElementById('psirtDetectedCols').style.display    = 'none';
+  document.getElementById('psirtColMappingWrap').style.display  = 'none';
+  document.getElementById('psirtSummaryBar').style.display      = 'none';
+  document.getElementById('psirtDownloadBar').style.display     = 'none';
+  document.getElementById('psirtTableWrap').style.display       = 'none';
+  psirtProgressWrap.style.display = 'none';
+  psirtRows = []; psirtHeaders = []; psirtCols = [];
+});
+
+function setPsirtProgress(pct, msg) {
+  psirtProgressWrap.style.display = 'block';
+  psirtProgressFill.style.width = pct + '%';
+  psirtProgressText.textContent = msg;
+}
+
+psirtUploadBtn.addEventListener('click', () => doPsirtUpload());
+
+async function doPsirtUpload(extraFields = {}) {
+  const f = psirtFileInput.files[0];
+  if (!f) return;
+  psirtUploadBtn.disabled = true;
+  psirtUploadStatus.textContent = '';
+  document.getElementById('psirtColMappingWrap').style.display = 'none';
+  setPsirtProgress(10, 'Uploading file…');
+
+  const fd = new FormData();
+  fd.append('file', f);
+  for (const [k, v] of Object.entries(extraFields)) fd.append(k, v);
+
+  try {
+    setPsirtProgress(30, 'Querying PSIRT API (1 call per unique version — may take a moment)…');
+    const resp = await fetch('/psirt/upload', { method: 'POST', body: fd });
+    const data = await resp.json();
+
+    if (data.needs_mapping && data.context === 'psirt') {
+      psirtProgressWrap.style.display = 'none';
+      const makeOpts = () => '<option value="">-- None --</option>' +
+        data.available_columns.map(c => `<option value="${c.replace(/"/g,'&quot;')}">${c}</option>`).join('');
+      document.getElementById('psirtManualVersionSel').innerHTML = makeOpts();
+      document.getElementById('psirtManualOsTypeSel').innerHTML  = makeOpts();
+      document.getElementById('psirtColMappingWrap').style.display = 'block';
+      return;
+    }
+    if (!resp.ok) {
+      psirtUploadStatus.textContent = 'Error: ' + (data.error || 'Unknown');
+      psirtProgressWrap.style.display = 'none';
+      return;
+    }
+
+    setPsirtProgress(100, `Done — ${data.stats.total} rows processed (${data.stats.unique_versions} unique versions)`);
+
+    document.getElementById('psirtColVersion').textContent = data.version_col ? `Version: "${data.version_col}"` : 'Version: not found';
+    document.getElementById('psirtColOsType').textContent  = data.os_type_col ? `OS Type: "${data.os_type_col}"` : `OS Type: default (${data.default_os_type})`;
+    document.getElementById('psirtDetectedCols').style.display = 'block';
+
+    psirtRows    = data.rows;
+    psirtHeaders = data.headers;
+    psirtCols    = data.psirt_col_names;
+    psirtPage    = 1;
+
+    renderPsirtSummary(data.stats);
+    renderPsirtTable();
+
+    document.getElementById('psirtDownloadLink').href = `/psirt/download/${data.job_id}`;
+    document.getElementById('psirtDownloadBar').style.display = 'block';
+
+  } catch(err) {
+    psirtUploadStatus.textContent = 'Error: ' + err.message;
+    psirtProgressWrap.style.display = 'none';
+  } finally {
+    psirtUploadBtn.disabled = false;
+  }
+}
+
+function psirtResubmitWithMapping() {
+  const versionCol    = document.getElementById('psirtManualVersionSel').value;
+  const osTypeCol     = document.getElementById('psirtManualOsTypeSel').value;
+  const defaultOsType = document.getElementById('psirtDefaultOsTypeSel').value;
+  if (!versionCol) { psirtUploadStatus.textContent = 'Select the software version column.'; return; }
+  const extra = { version_col: versionCol, default_os_type: defaultOsType };
+  if (osTypeCol) extra.os_type_col = osTypeCol;
+  doPsirtUpload(extra);
+}
+
+function renderPsirtSummary(s) {
+  const bar = document.getElementById('psirtSummaryBar');
+  bar.style.display = 'flex';
+  bar.innerHTML = `
+    <span class="pill pill-total">${s.total} Total Rows</span>
+    <span class="pill pill-c">${s.compliant} Compliant</span>
+    <span class="pill pill-nc">${s.non_compliant} Non-Compliant</span>
+    <span class="pill pill-uk">${s.na} NA</span>
+    <span class="pill pill-uk">${s.unique_versions} Unique Versions</span>`;
+}
+
+function renderPsirtTable() {
+  document.getElementById('psirtTableWrap').style.display = 'block';
+  const isPsirt = col => psirtCols.includes(col);
+  document.getElementById('psirtThead').innerHTML =
+    '<tr>' + psirtHeaders.map(h => `<th class="${isPsirt(h)?'eox-col':''}">${h}</th>`).join('') + '</tr>';
+  renderPsirtPage(psirtPage);
+}
+
+function renderPsirtPage(page) {
+  psirtPage = page;
+  const start = (page - 1) * PAGE_SIZE;
+  const slice = psirtRows.slice(start, start + PAGE_SIZE);
+  const compCol = 'PSIRT Compliance';
+  document.getElementById('psirtTbody').innerHTML = slice.map(row =>
+    '<tr>' + psirtHeaders.map(h => {
+      const v = row[h];
+      if (h === compCol) return `<td>${psirtComplianceBadge(v||'')}</td>`;
+      if (psirtCols.includes(h) && h !== compCol) {
+        const d = (v === null || v === undefined || v === '') ? '' : String(v);
+        return `<td class="${!d?'na':'mono'}" title="${d.replace(/"/g,'&quot;')}">${d||'N/A'}</td>`;
+      }
+      const d = (v === null || v === undefined || v === '') ? '' : String(v);
+      return `<td title="${d.replace(/"/g,'&quot;')}">${d}</td>`;
+    }).join('') + '</tr>'
+  ).join('');
+  renderPsirtPagination();
+}
+
+function renderPsirtPagination() {
+  const total = psirtRows.length;
+  const pages = Math.ceil(total / PAGE_SIZE);
+  const pg = document.getElementById('psirtPagination');
+  if (pages <= 1) { pg.innerHTML = ''; return; }
+  let html = `<span class="page-info-txt">Rows ${(psirtPage-1)*PAGE_SIZE+1}–${Math.min(psirtPage*PAGE_SIZE,total)} of ${total}</span>`;
+  if (psirtPage > 1) html += `<button class="page-btn" onclick="renderPsirtPage(${psirtPage-1})">‹ Prev</button>`;
+  const ps = Math.max(1, psirtPage-3), pe = Math.min(pages, psirtPage+3);
+  for (let i = ps; i <= pe; i++)
+    html += `<button class="page-btn${i===psirtPage?' active':''}" onclick="renderPsirtPage(${i})">${i}</button>`;
+  if (psirtPage < pages) html += `<button class="page-btn" onclick="renderPsirtPage(${psirtPage+1})">Next ›</button>`;
+  pg.innerHTML = html;
+}
 </script>
 </body>
 </html>
@@ -1402,6 +1803,119 @@ def swim_download(job_id: str):
         buf,
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         download_name="cisco_swim_enriched.xlsx",
+        as_attachment=True,
+    )
+
+
+@app.route("/psirt/search", methods=["POST"])
+def psirt_search():
+    data = request.get_json(force=True)
+    os_type = (data.get("os_type") or "").strip().lower()
+    version = (data.get("version") or "").strip()
+    if not os_type or not version:
+        return jsonify({"error": "Provide os_type and version"}), 400
+    if os_type not in cisco_psirt.OS_TYPES:
+        return jsonify({"error": f"Unknown OS type '{os_type}'. Valid: {', '.join(cisco_psirt.OS_TYPES)}"}), 400
+    try:
+        result = cisco_psirt.query_psirt_by_version(os_type, version)
+    except Exception as e:
+        return jsonify({"error": f"API error: {e}"}), 502
+    return jsonify({"result": result})
+
+
+@app.route("/psirt/upload", methods=["POST"])
+def psirt_upload():
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "Empty filename"}), 400
+
+    fname = f.filename.lower()
+    try:
+        df = pd.read_csv(f, dtype=str) if fname.endswith(".csv") else pd.read_excel(f, dtype=str)
+    except Exception as e:
+        return jsonify({"error": f"Could not read file: {e}"}), 400
+    df = df.fillna("")
+
+    version_col     = request.form.get("version_col", "").strip()     or _find_col(df, SWIM_VERSION_KEYWORDS)
+    os_type_col     = request.form.get("os_type_col", "").strip()     or _find_col(df, OS_TYPE_KEYWORDS)
+    default_os_type = request.form.get("default_os_type", "iosxe").strip().lower()
+
+    if not version_col:
+        return jsonify({"needs_mapping": True, "available_columns": list(df.columns), "context": "psirt"})
+
+    # Build unique (os_type, version) pairs
+    pairs: list[tuple[str, str]] = []
+    for _, row in df.iterrows():
+        ver = str(row[version_col]).strip()
+        if not ver:
+            continue
+        ost = str(row[os_type_col]).strip().lower() if os_type_col else default_os_type
+        if not ost or ost not in cisco_psirt.OS_TYPES:
+            ost = default_os_type
+        pairs.append((ost, ver))
+
+    unique_pairs = list(dict.fromkeys(pairs))  # deduplicate preserving order
+    try:
+        psirt_lookup = _build_psirt_lookup(unique_pairs)
+    except Exception as e:
+        return jsonify({"error": f"PSIRT API error: {e}"}), 502
+
+    psirt_col_names = [c[0] for c in PSIRT_COLS]
+    for col_name in psirt_col_names:
+        df[col_name] = ""
+
+    for idx, row in df.iterrows():
+        ver = str(row[version_col]).strip()
+        if not ver:
+            df.at[idx, "PSIRT Compliance"] = "NA"
+            continue
+        ost = str(row[os_type_col]).strip().lower() if os_type_col else default_os_type
+        if not ost or ost not in cisco_psirt.OS_TYPES:
+            ost = default_os_type
+        rec = psirt_lookup.get((ost, ver.lower())) or {}
+        df.at[idx, "PSIRT Compliance"]          = rec.get("compliance", "")
+        df.at[idx, "PSIRT Critical Advisories"]  = str(rec.get("critical_count", "")) if rec else ""
+        df.at[idx, "PSIRT Advisory IDs"]         = rec.get("advisory_ids", "")
+        df.at[idx, "PSIRT CVEs"]                 = rec.get("cves", "")
+
+    comp_col = df["PSIRT Compliance"]
+    stats = {
+        "total":           len(df),
+        "unique_versions": len(unique_pairs),
+        "compliant":       int((comp_col == "Compliant").sum()),
+        "non_compliant":   int((comp_col == "Non-Compliant").sum()),
+        "na":              int(((comp_col == "NA") | (comp_col == "")).sum()),
+    }
+
+    job_id = str(uuid.uuid4())[:8]
+    _store_job(job_id, df)
+
+    return jsonify({
+        "job_id":          job_id,
+        "version_col":     version_col,
+        "os_type_col":     os_type_col,
+        "default_os_type": default_os_type,
+        "headers":         list(df.columns),
+        "psirt_col_names": psirt_col_names,
+        "rows":            df.to_dict(orient="records"),
+        "stats":           stats,
+    })
+
+
+@app.route("/psirt/download/<job_id>")
+def psirt_download(job_id: str):
+    df = _load_job(job_id)
+    if df is None:
+        return "Job not found or expired", 404
+    buf = io.BytesIO()
+    df.to_excel(buf, index=False, engine="openpyxl")
+    buf.seek(0)
+    return send_file(
+        buf,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        download_name="cisco_psirt_enriched.xlsx",
         as_attachment=True,
     )
 

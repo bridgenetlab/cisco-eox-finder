@@ -105,11 +105,13 @@ cisco-eox-finder/
 ├── tools/
 │   ├── cisco_eox.py          # EOX API client + CLI entry point
 │   ├── cisco_swim.py         # SWIM API client + CLI entry point
-│   ├── cisco_eox_webapp.py   # Flask web app (imports cisco_eox + cisco_swim)
+│   ├── cisco_psirt.py        # PSIRT openVuln API client + CLI entry point
+│   ├── cisco_eox_webapp.py   # Flask web app (imports cisco_eox + cisco_swim + cisco_psirt)
 │   └── requirements.txt      # Python dependencies
 ├── workflows/
 │   ├── cisco_eox_lookup.md   # SOP for EOX data retrieval
-│   └── cisco_swim_lookup.md  # SOP for SWIM software suggestion lookup
+│   ├── cisco_swim_lookup.md  # SOP for SWIM software suggestion lookup
+│   └── cisco_psirt_lookup.md # SOP for PSIRT security advisory lookup
 ├── .github/
 │   └── workflows/
 │       └── docker-publish.yml  # CI/CD: builds and pushes Docker image to GHCR
@@ -257,9 +259,67 @@ python cisco_swim.py --pid ASR-903 --all-pages
 
 ---
 
+### `tools/cisco_psirt.py` — PSIRT openVuln API Client
+
+Queries the Cisco PSIRT openVuln API v2 for security advisories by OS type and software version.
+
+**Environment variables required:** same as EOX (`CISCO_CLIENT_ID`, `CISCO_CLIENT_SECRET`).
+`get_access_token()` is imported from `cisco_eox` — the token cache is shared.
+
+Optional: `PSIRT_SEVERITY_THRESHOLD` (default `Critical`; set to `High` to flag High advisories too).
+
+**Supported OS types:** `ios`, `iosxe`, `nxos`, `asa`, `ftd`, `fxos`, `fmc`
+
+**Key functions:**
+
+| Function | Purpose |
+|---|---|
+| `query_psirt_by_version(os_type, version)` | Returns `{os_type, version, advisories, compliance, error}` |
+| `get_psirt_summary(os_type, version)` | Returns `{compliance, critical_count, advisory_ids, cves}` or `None` |
+| `_parse_psirt_advisory(adv)` | Flatten API advisory dict → normalized dict |
+| `_psirt_compliance(advisories)` | Returns `Compliant` / `Non-Compliant` based on SEVERITY_THRESHOLD |
+
+**Compliance rules:**
+
+| Status | Condition |
+|---|---|
+| `Non-Compliant` | Advisory with SIR ≥ `SEVERITY_THRESHOLD` found |
+| `Compliant` | No advisory meets the threshold (including empty advisory list) |
+| `NA` | No version provided — callers set this when version is absent |
+
+**Normalized advisory output:**
+```python
+{
+    "advisory_id":     str,   # e.g. "cisco-sa-..."
+    "title":           str,
+    "sir":             str,   # Critical / High / Medium / Low
+    "cvss_score":      str,
+    "cves":            list[str],
+    "bug_ids":         list[str],
+    "first_published": str,   # ISO datetime
+    "publication_url": str,
+}
+```
+
+**CLI usage:**
+```bash
+cd tools
+python cisco_psirt.py --os-type iosxe --version 16.11.1
+python cisco_psirt.py --os-type iosxe --version 16.11.1 --json
+python cisco_psirt.py --os-type iosxe --version 16.11.1 --severity Critical
+```
+
+**API constraints:**
+- One call per (os_type, version) pair — no batch endpoint
+- Rate limits: 5 calls/sec · 30 calls/min · 5,000 calls/day
+- No PID or serial number lookup — OS type + version required
+- Empty advisory list → Compliant (version not in catalogue is not an error)
+
+---
+
 ### `tools/cisco_eox_webapp.py` — Flask Web Application
 
-Imports `cisco_eox` and `cisco_swim`. Serves a single-page application with three tabs.
+Imports `cisco_eox`, `cisco_swim`, and `cisco_psirt`. Serves a single-page application with four tabs.
 
 **Routes:**
 
@@ -273,6 +333,9 @@ Imports `cisco_eox` and `cisco_swim`. Serves a single-page application with thre
 | `/swim/search` | POST | Single PID SWIM lookup; returns `{result: {...}}` |
 | `/swim/upload` | POST | Accept `.xlsx`/`.csv`, enrich with SWIM suggested release + compliance |
 | `/swim/download/<job_id>` | GET | Stream SWIM-enriched Excel for download |
+| `/psirt/search` | POST | Single version PSIRT lookup; returns `{result: {...}}` |
+| `/psirt/upload` | POST | Accept `.xlsx`/`.csv`, enrich with PSIRT advisory + compliance data |
+| `/psirt/download/<job_id>` | GET | Stream PSIRT-enriched Excel for download |
 
 **EOX bulk upload behavior:**
 1. Reads file (`.xlsx`/`.xls`/`.csv`) into a Pandas DataFrame (all columns as strings)
@@ -291,6 +354,16 @@ Imports `cisco_eox` and `cisco_swim`. Serves a single-page application with thre
 5. Appends 3 new columns: SWIM Suggested Release, SWIM Lifecycle, SWIM Compliance
 6. SWIM Compliance is only populated when a version column is detected
 7. Stores enriched DataFrame in the shared SQLite job store
+
+**PSIRT bulk upload behavior:**
+1. Reads file (`.xlsx`/`.xls`/`.csv`) into a Pandas DataFrame (all columns as strings)
+2. Auto-detects version column (same keywords as SWIM)
+3. Auto-detects OS Type column (keywords: "os type", "software type", "platform")
+4. If no OS Type column, all rows use `default_os_type` (default: `iosxe`; selectable in mapping UI)
+5. **One API call per unique (os_type, version) pair** — rate limit: 5 calls/sec
+6. Appends 4 new columns: PSIRT Compliance, PSIRT Critical Advisories, PSIRT Advisory IDs, PSIRT CVEs
+7. Rows with no version value get `PSIRT Compliance = NA`
+8. Stores enriched DataFrame in the shared SQLite job store
 
 **Starting the web app:**
 ```bash
