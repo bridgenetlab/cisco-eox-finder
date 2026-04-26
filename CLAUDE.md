@@ -25,6 +25,68 @@ You're working inside the **WAT framework** (Workflows, Agents, Tools). This arc
 
 ---
 
+## Behavioral Guidelines
+
+These guidelines reduce common AI coding mistakes. They bias toward caution over speed — for trivial tasks, use judgment.
+
+### 1. Think Before Coding
+
+**Don't assume. Don't hide confusion. Surface tradeoffs.**
+
+Before implementing:
+- State your assumptions explicitly. If uncertain, ask.
+- If multiple interpretations exist, present them — don't pick silently.
+- If a simpler approach exists, say so. Push back when warranted.
+- If something is unclear, stop. Name what's confusing. Ask.
+
+### 2. Simplicity First
+
+**Minimum code that solves the problem. Nothing speculative.**
+
+- No features beyond what was asked.
+- No abstractions for single-use code.
+- No "flexibility" or "configurability" that wasn't requested.
+- No error handling for impossible scenarios.
+- If you write 200 lines and it could be 50, rewrite it.
+
+Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+
+### 3. Surgical Changes
+
+**Touch only what you must. Clean up only your own mess.**
+
+When editing existing code:
+- Don't "improve" adjacent code, comments, or formatting.
+- Don't refactor things that aren't broken.
+- Match existing style, even if you'd do it differently.
+- If you notice unrelated dead code, mention it — don't delete it.
+
+When your changes create orphans:
+- Remove imports/variables/functions that YOUR changes made unused.
+- Don't remove pre-existing dead code unless asked.
+
+The test: every changed line should trace directly to the user's request.
+
+### 4. Goal-Driven Execution
+
+**Define success criteria. Loop until verified.**
+
+Transform tasks into verifiable goals:
+- "Add validation" → "Write tests for invalid inputs, then make them pass"
+- "Fix the bug" → "Write a test that reproduces it, then make it pass"
+- "Refactor X" → "Ensure tests pass before and after"
+
+For multi-step tasks, state a brief plan:
+```
+1. [Step] → verify: [check]
+2. [Step] → verify: [check]
+3. [Step] → verify: [check]
+```
+
+Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+
+---
+
 ## Project Overview
 
 This is the **Cisco EOX Finder** — a tool for querying Cisco's End-of-Life (EOX) Support API to surface compliance status for network hardware. It has two interfaces:
@@ -185,11 +247,11 @@ The SOP for any EOX data retrieval task. Always read this before querying. Key s
 All dependencies are in `tools/requirements.txt`:
 
 ```
-requests>=2.31.0    # HTTP + OAuth2
-flask>=3.0.0        # Web framework
+requests>=2.31.0      # HTTP + OAuth2
+flask>=3.0.0          # Web framework
 python-dotenv>=1.0.0  # Load .env
-pandas>=2.0.0       # Excel processing
-openpyxl>=3.1.0     # Excel writer engine
+pandas>=2.0.0         # Excel processing
+openpyxl>=3.1.0       # Excel writer engine
 ```
 
 Install:
@@ -255,12 +317,15 @@ Use `unraid-template.xml` via the Unraid Community Applications template system.
 **1. Look for existing tools first**
 Before building anything, check `tools/` and the relevant workflow. Only create new scripts when nothing covers the task.
 
-**2. Learn and adapt when things fail**
+**2. Plan before you act**
+For multi-step tasks, write out a brief plan with a verifiable check for each step before touching any code. Confirm the plan if the scope is ambiguous.
+
+**3. Learn and adapt when things fail**
 - Read the full error trace
 - Fix the script and retest (confirm with the user before re-running paid API calls)
 - Document findings in the workflow's Self-Improvement Log
 
-**3. Keep workflows current**
+**4. Keep workflows current**
 Update `workflows/cisco_eox_lookup.md` when you discover rate limits, new edge cases, or better approaches. Don't create or overwrite workflows without asking.
 
 ---
