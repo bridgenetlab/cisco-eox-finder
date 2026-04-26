@@ -89,10 +89,10 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 ## Project Overview
 
-This is the **Cisco EOX Finder** — a tool for querying Cisco's End-of-Life (EOX) Support API to surface compliance status for network hardware. It has two interfaces:
+This is the **Cisco EOX Finder** — a tool for querying Cisco's End-of-Life (EOX) and Software Suggestion (SWIM) APIs to surface compliance status for network hardware. It has two interfaces:
 
-1. **CLI** (`tools/cisco_eox.py`) — direct terminal lookups by Product ID or Serial Number
-2. **Web App** (`tools/cisco_eox_webapp.py`) — Flask UI for single lookups and bulk Excel enrichment
+1. **CLI** (`tools/cisco_eox.py`, `tools/cisco_swim.py`) — direct terminal lookups by Product ID or Serial Number
+2. **Web App** (`tools/cisco_eox_webapp.py`) — Flask UI with three tabs: Single Search, Bulk Excel Upload, and SWIM
 
 The app is containerized and published to GHCR via GitHub Actions. It can be self-hosted on Docker or Unraid.
 
@@ -103,11 +103,13 @@ The app is containerized and published to GHCR via GitHub Actions. It can be sel
 ```
 cisco-eox-finder/
 ├── tools/
-│   ├── cisco_eox.py          # Core API client + CLI entry point
-│   ├── cisco_eox_webapp.py   # Flask web app (imports cisco_eox)
+│   ├── cisco_eox.py          # EOX API client + CLI entry point
+│   ├── cisco_swim.py         # SWIM API client + CLI entry point
+│   ├── cisco_eox_webapp.py   # Flask web app (imports cisco_eox + cisco_swim)
 │   └── requirements.txt      # Python dependencies
 ├── workflows/
-│   └── cisco_eox_lookup.md   # SOP for EOX data retrieval
+│   ├── cisco_eox_lookup.md   # SOP for EOX data retrieval
+│   └── cisco_swim_lookup.md  # SOP for SWIM software suggestion lookup
 ├── .github/
 │   └── workflows/
 │       └── docker-publish.yml  # CI/CD: builds and pushes Docker image to GHCR
@@ -195,27 +197,100 @@ python cisco_eox.py --pid "PID1,PID2" --json      # raw JSON output
 
 ---
 
+---
+
+### `tools/cisco_swim.py` — SWIM API Client
+
+Queries the Cisco Software Suggestion API v2 for recommended software releases by Product ID.
+
+**Environment variables required:** same as EOX (`CISCO_CLIENT_ID`, `CISCO_CLIENT_SECRET`).
+`get_access_token()` is imported from `cisco_eox` — the token cache is shared.
+
+**Key functions:**
+
+| Function | Purpose |
+|---|---|
+| `query_swim_by_pid(pid, page_index)` | Single-page SWIM query; returns `{query, pagination, products, error}` |
+| `query_all_pages_swim_by_pid(pid)` | Walks all pages; returns combined products list |
+| `get_suggested_release(pid)` | Returns `{suggested_release, lifecycle}` for the first `isSuggested=True` entry, or `None` |
+| `_parse_swim_product(product)` | Flatten API product dict → normalized dict |
+| `_parse_swim_suggestion(suggestion)` | Flatten API suggestion dict |
+| `_parse_swim_image(image)` | Flatten API image dict |
+| `_swim_compliance(current_version, suggested_release)` | Returns `Compliant` / `Non-Compliant` / `Unknown` |
+
+**Normalized product output:**
+```python
+{
+  "base_pid":      str,
+  "mdf_id":        str,
+  "product_name":  str,
+  "software_type": str,
+  "suggestions": [
+    {
+      "is_suggested":   bool,
+      "release_format": str,   # e.g. "16.11.01"
+      "release_date":   str,   # YYYY-MM-DD
+      "lifecycle":      str,   # e.g. "LONG_LIVED"
+      "display_name":   str,
+      "train_display":  str,
+      "images": [
+        {"name": str, "size_bytes": str, "feature_set": str,
+         "description": str, "required_dram": str, "required_flash": str}
+      ],
+      "error": str | None
+    }
+  ]
+}
+```
+
+**CLI usage:**
+```bash
+cd tools
+python cisco_swim.py --pid ASR-903
+python cisco_swim.py --pid WS-C3850-24T --json
+python cisco_swim.py --pid ASR-903 --all-pages
+```
+
+**API constraints:**
+- One PID per request — no wildcards, no comma-separated lists, no SN lookup
+- Not all Cisco PIDs are in the SWIM catalogue; missing PIDs return an empty suggestions list
+
+---
+
 ### `tools/cisco_eox_webapp.py` — Flask Web Application
 
-Imports `cisco_eox` as a module. Serves a single-page application with two tabs.
+Imports `cisco_eox` and `cisco_swim`. Serves a single-page application with three tabs.
 
 **Routes:**
 
 | Route | Method | Purpose |
 |---|---|---|
 | `/` | GET | Serve embedded HTML/CSS/JS UI |
-| `/search` | POST | Single PID/SN lookup; returns `{results: [...]}` |
-| `/upload` | POST | Accept `.xlsx`/`.xls`, enrich with EOX data, store as job |
-| `/download/<job_id>` | GET | Stream enriched Excel file for download |
+| `/health` | GET | Health check; returns `{"status": "ok"}` |
+| `/search` | POST | Single PID/SN EOX lookup; returns `{results: [...]}` |
+| `/upload` | POST | Accept `.xlsx`/`.csv`, enrich with EOX data, store as job |
+| `/download/<job_id>` | GET | Stream EOX-enriched Excel for download |
+| `/swim/search` | POST | Single PID SWIM lookup; returns `{result: {...}}` |
+| `/swim/upload` | POST | Accept `.xlsx`/`.csv`, enrich with SWIM suggested release + compliance |
+| `/swim/download/<job_id>` | GET | Stream SWIM-enriched Excel for download |
 
-**Bulk upload behavior:**
-1. Reads Excel file into a Pandas DataFrame (all columns as strings)
+**EOX bulk upload behavior:**
+1. Reads file (`.xlsx`/`.xls`/`.csv`) into a Pandas DataFrame (all columns as strings)
 2. Auto-detects PID column (keywords: "product part", "pid", "part number", "part_no", "model", "pn")
 3. Auto-detects SN column (keywords: "serial number", "s/n", "serial_no", "serial")
 4. Batches unique PIDs in groups of 20 to respect API limits
 5. Appends 7 new columns: End of Sale, End of SW, End of Security, End of Service Contract, Last Date, Compliance, Migration PID
-6. Stores enriched DataFrame in `_jobs` dict (in-memory, UUID key)
+6. Stores enriched DataFrame in SQLite job store (UUID key, 24h TTL)
 7. Returns job ID and preview data; download triggered separately
+
+**SWIM bulk upload behavior:**
+1. Reads file (`.xlsx`/`.xls`/`.csv`) into a Pandas DataFrame (all columns as strings)
+2. Auto-detects PID column using same keywords as EOX
+3. Auto-detects version column (keywords: "current version", "sw version", "running version", "ios version", "firmware")
+4. **One API call per unique PID** — SWIM has no batch endpoint; large uploads can be slow
+5. Appends 3 new columns: SWIM Suggested Release, SWIM Lifecycle, SWIM Compliance
+6. SWIM Compliance is only populated when a version column is detected
+7. Stores enriched DataFrame in the shared SQLite job store
 
 **Starting the web app:**
 ```bash

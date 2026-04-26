@@ -22,6 +22,7 @@ from flask import Flask, jsonify, render_template_string, request, send_file
 
 sys.path.insert(0, str(Path(__file__).parent))
 import cisco_eox
+import cisco_swim
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB
@@ -79,6 +80,18 @@ EOX_COLS = [
     ("EOX Migration PID",            "migration_product_id"),
 ]
 
+# ── SWIM columns and version-column detection ────────────────────────────────
+SWIM_VERSION_KEYWORDS = [
+    "current version", "current_version", "sw version", "software version",
+    "running version", "ios version", "firmware",
+]
+
+SWIM_COLS = [
+    ("SWIM Suggested Release", "suggested_release"),
+    ("SWIM Lifecycle",         "lifecycle"),
+    ("SWIM Compliance",        "swim_compliance"),
+]
+
 # ── Batched lookups ──────────────────────────────────────────────────────────
 def _build_pid_lookup(pids: list[str]) -> dict[str, dict]:
     """Query EOX API for a list of unique PIDs (batched 20 at a time)."""
@@ -107,6 +120,20 @@ def _build_sn_lookup(sns: list[str]) -> dict[str, dict]:
         for j, rec in enumerate(result.get("records", [])):
             if j < len(batch) and "error" not in rec:
                 lookup[batch[j].upper()] = rec
+    return lookup
+
+def _build_swim_lookup(pids: list[str]) -> dict[str, dict]:
+    """Query SWIM API for unique PIDs one at a time (no batch support in the API)."""
+    lookup: dict[str, dict] = {}
+    for pid in pids:
+        if not pid:
+            continue
+        try:
+            rec = cisco_swim.get_suggested_release(pid)
+            lookup[pid.upper()] = rec or {}
+        except Exception as exc:
+            print(f"SWIM lookup failed for {pid}: {exc}", file=sys.stderr)
+            lookup[pid.upper()] = {}
     return lookup
 
 # ── HTML ─────────────────────────────────────────────────────────────────────
@@ -335,12 +362,13 @@ select:focus { outline: none; border-color: #1f6feb; }
 
 <header>
   <div class="logo">Cisco <span>EOX</span> Finder</div>
-  <p>End-of-Life compliance checker — EOX V5 API</p>
+  <p>End-of-Life compliance · Software Image Management — Cisco APIs</p>
 </header>
 
 <div class="tabs">
   <button class="tab-btn active" data-tab="single">Single Search</button>
   <button class="tab-btn" data-tab="bulk">Bulk Excel Upload</button>
+  <button class="tab-btn" data-tab="swim">SWIM</button>
 </div>
 
 <!-- ── Single Search ── -->
@@ -434,6 +462,76 @@ select:focus { outline: none; border-color: #1f6feb; }
       <tbody id="bulkTbody"></tbody>
     </table>
     <div class="pagination" id="pagination"></div>
+  </div>
+</div>
+
+<!-- ── SWIM Tab ── -->
+<div id="tab-swim" class="tab-panel">
+
+  <!-- Single search -->
+  <div class="card">
+    <h2>SWIM — Software Image Lookup</h2>
+    <form id="swimSearchForm">
+      <div class="form-row" style="grid-template-columns:1fr">
+        <div>
+          <label for="swimPid">Product ID</label>
+          <input type="text" id="swimPid" name="swimPid" placeholder="e.g. ASR-903" autocomplete="off">
+          <div class="hint">One PID at a time — SWIM API does not support batching or wildcards</div>
+        </div>
+      </div>
+      <div class="btn-row">
+        <button type="submit" id="swimSearchBtn" class="btn-primary">Get Suggested Software</button>
+        <button type="button" id="swimClearBtn" class="btn-secondary">Clear</button>
+        <span id="swimSearchStatus" class="status-msg"></span>
+      </div>
+    </form>
+  </div>
+  <div id="swimResults"></div>
+
+  <!-- Bulk upload -->
+  <div class="card">
+    <h2>SWIM Bulk Upload</h2>
+    <div class="drop-zone" id="swimDropZone">
+      <div class="drop-icon">💿</div>
+      <p>Drag &amp; drop your Excel file here, or click to browse</p>
+      <p style="font-size:0.75rem;color:#6e7681">.xlsx / .csv · detects "Product Part" and optionally "Current Version"</p>
+      <input type="file" id="swimFileInput" accept=".xlsx,.xls,.csv" style="display:none">
+    </div>
+    <div id="swimDetectedCols" style="display:none;margin-bottom:1rem;">
+      <span style="font-size:0.8rem;color:#8b949e">Detected columns: </span>
+      <span id="swimColPid"     style="font-size:0.8rem;color:#3fb950;font-family:monospace"></span>
+      <span style="font-size:0.8rem;color:#6e7681"> · </span>
+      <span id="swimColVersion" style="font-size:0.8rem;color:#3fb950;font-family:monospace"></span>
+    </div>
+    <div class="progress-wrap" id="swimProgressWrap">
+      <div class="progress-bar-bg"><div class="progress-bar-fill" id="swimProgressFill" style="width:0%"></div></div>
+      <div class="progress-text" id="swimProgressText">Processing…</div>
+    </div>
+    <div id="swimColMappingWrap" style="display:none">
+      <p style="font-size:0.85rem;color:#8b949e;margin-bottom:0.75rem">Could not auto-detect columns. Select the correct ones below:</p>
+      <div class="form-row">
+        <div><label>Product ID Column</label><select id="swimManualPidSel"></select></div>
+        <div><label>Current Version Column (optional)</label><select id="swimManualVersionSel"></select></div>
+      </div>
+      <div class="btn-row" style="margin-top:0.75rem">
+        <button class="btn-primary" onclick="swimResubmitWithMapping()">Process with Selected Columns</button>
+      </div>
+    </div>
+    <div class="btn-row">
+      <button id="swimUploadBtn" class="btn-primary" disabled>Process File</button>
+      <button id="swimClearUploadBtn" class="btn-secondary">Clear</button>
+      <span id="swimUploadStatus" class="status-msg"></span>
+    </div>
+  </div>
+
+  <div id="swimSummaryBar"  class="summary-bar"                        style="display:none"></div>
+  <div id="swimDownloadBar" style="max-width:1200px;margin:0 auto 1rem;display:none">
+    <a id="swimDownloadLink" class="btn-green" href="#">⬇ Download Enriched Excel</a>
+    <span style="font-size:0.8rem;color:#6e7681;margin-left:0.75rem">Includes all original columns + SWIM suggested release + compliance</span>
+  </div>
+  <div id="swimTableWrap" class="table-wrap" style="display:none">
+    <table id="swimTable"><thead id="swimThead"></thead><tbody id="swimTbody"></tbody></table>
+    <div class="pagination" id="swimPagination"></div>
   </div>
 </div>
 
@@ -798,6 +896,268 @@ function applyHistory(i) {
 }
 
 renderHistory();
+
+// ── SWIM Single Search ────────────────────────────────────────────────────────
+const swimSearchForm   = document.getElementById('swimSearchForm');
+const swimResultsDiv   = document.getElementById('swimResults');
+const swimSearchStatus = document.getElementById('swimSearchStatus');
+const swimSearchBtn    = document.getElementById('swimSearchBtn');
+
+document.getElementById('swimClearBtn').addEventListener('click', () => {
+  document.getElementById('swimPid').value = '';
+  swimResultsDiv.innerHTML = '';
+  swimSearchStatus.textContent = '';
+});
+
+swimSearchForm.addEventListener('submit', async e => {
+  e.preventDefault();
+  const pid = document.getElementById('swimPid').value.trim();
+  if (!pid) { swimSearchStatus.textContent = 'Enter a Product ID.'; return; }
+  swimSearchBtn.disabled = true;
+  swimSearchStatus.textContent = '';
+  swimResultsDiv.innerHTML = '<div class="loading"><span class="spinner"></span>Querying SWIM API…</div>';
+  try {
+    const resp = await fetch('/swim/search', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({pid}),
+    });
+    const data = await resp.json();
+    if (!resp.ok) { swimResultsDiv.innerHTML = `<div class="error-msg">Error: ${data.error || 'Unknown'}</div>`; return; }
+    renderSwimResults(data.result);
+  } catch(err) {
+    swimResultsDiv.innerHTML = `<div class="error-msg">Network error: ${err.message}</div>`;
+  } finally { swimSearchBtn.disabled = false; }
+});
+
+function lifecycleBadge(lc) {
+  const cl = (lc || '').toUpperCase();
+  const css = cl === 'LONG_LIVED' ? 'badge-sm-c' : cl === 'CURRENT' ? 'badge-sm-c' : 'badge-sm-uk';
+  return `<span class="badge-sm ${css}">${lc || 'N/A'}</span>`;
+}
+
+function renderSwimResults(result) {
+  if (!result) { swimResultsDiv.innerHTML = '<div class="no-results">No result.</div>'; return; }
+  if (result.error) { swimResultsDiv.innerHTML = `<div class="error-msg">${result.error}</div>`; return; }
+  if (!result.products || !result.products.length) {
+    swimResultsDiv.innerHTML = '<div class="no-results">No software suggestions found for this PID.</div>';
+    return;
+  }
+  let html = '';
+  for (const p of result.products) {
+    html += `<div class="eox-card compliant">
+      <div class="eox-top">
+        <div><div class="eox-pid">${p.base_pid}</div><div class="eox-name">${p.product_name || ''}</div></div>
+        <div style="font-size:0.8rem;color:#8b949e">${p.software_type || ''}</div>
+      </div>`;
+    for (const s of (p.suggestions || [])) {
+      if (s.error) { html += `<div class="error-msg" style="margin-bottom:0.5rem">${s.error}</div>`; continue; }
+      const sugBadge = s.is_suggested
+        ? '<span class="badge-sm badge-sm-c" style="margin-left:0.5rem">★ Suggested</span>' : '';
+      html += `<div style="background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:0.75rem;margin-bottom:0.6rem">
+        <div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.5rem">
+          <span class="eox-pid" style="font-size:0.95rem">${s.display_name}</span>
+          ${lifecycleBadge(s.lifecycle)}${sugBadge}
+        </div>
+        <div class="eox-dates">
+          <div><div class="date-label">Train</div><span class="date-value">${s.train_display || 'N/A'}</span></div>
+          <div><div class="date-label">Release Date</div><span class="date-value">${s.release_date || 'N/A'}</span></div>
+          <div><div class="date-label">Lifecycle</div><span class="date-value">${s.lifecycle || 'N/A'}</span></div>
+        </div>`;
+      if (s.images && s.images.length) {
+        html += '<div style="margin-top:0.5rem"><div class="date-label" style="margin-bottom:0.35rem">Images</div>';
+        for (const img of s.images) {
+          const mb = img.size_bytes ? (parseInt(img.size_bytes)/1048576).toFixed(0)+' MB' : '';
+          html += `<div style="font-family:monospace;font-size:0.78rem;color:#c9d1d9;margin-bottom:0.2rem">
+            ${img.name}
+            <span style="color:#6e7681;margin-left:0.5rem">${mb}</span>
+            ${img.feature_set ? `<span style="color:#6e7681;margin-left:0.4rem">[${img.feature_set}]</span>` : ''}
+          </div>`;
+        }
+        html += '</div>';
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+  swimResultsDiv.innerHTML = html;
+}
+
+// ── SWIM Bulk Upload ──────────────────────────────────────────────────────────
+let swimRows    = [];
+let swimHeaders = [];
+let swimEoxCols = [];
+let swimPage    = 1;
+
+const swimDropZone     = document.getElementById('swimDropZone');
+const swimFileInput    = document.getElementById('swimFileInput');
+const swimUploadBtn    = document.getElementById('swimUploadBtn');
+const swimUploadStatus = document.getElementById('swimUploadStatus');
+const swimProgressWrap = document.getElementById('swimProgressWrap');
+const swimProgressFill = document.getElementById('swimProgressFill');
+const swimProgressText = document.getElementById('swimProgressText');
+
+swimDropZone.addEventListener('click', () => swimFileInput.click());
+swimDropZone.addEventListener('dragover', e => { e.preventDefault(); swimDropZone.classList.add('dragover'); });
+swimDropZone.addEventListener('dragleave', () => swimDropZone.classList.remove('dragover'));
+swimDropZone.addEventListener('drop', e => {
+  e.preventDefault(); swimDropZone.classList.remove('dragover');
+  if (e.dataTransfer.files[0]) setSwimFile(e.dataTransfer.files[0]);
+});
+swimFileInput.addEventListener('change', () => { if (swimFileInput.files[0]) setSwimFile(swimFileInput.files[0]); });
+
+function setSwimFile(f) {
+  swimDropZone.querySelector('p').textContent = `Selected: ${f.name} (${(f.size/1024).toFixed(0)} KB)`;
+  swimUploadBtn.disabled = false;
+  swimUploadStatus.textContent = '';
+  document.getElementById('swimDetectedCols').style.display = 'none';
+}
+
+document.getElementById('swimClearUploadBtn').addEventListener('click', () => {
+  swimFileInput.value = '';
+  swimDropZone.querySelector('p').textContent = 'Drag & drop your Excel file here, or click to browse';
+  swimUploadBtn.disabled = true;
+  swimUploadStatus.textContent = '';
+  document.getElementById('swimDetectedCols').style.display   = 'none';
+  document.getElementById('swimColMappingWrap').style.display = 'none';
+  document.getElementById('swimSummaryBar').style.display     = 'none';
+  document.getElementById('swimDownloadBar').style.display    = 'none';
+  document.getElementById('swimTableWrap').style.display      = 'none';
+  swimProgressWrap.style.display = 'none';
+  swimRows = []; swimHeaders = []; swimEoxCols = [];
+});
+
+function setSwimProgress(pct, msg) {
+  swimProgressWrap.style.display = 'block';
+  swimProgressFill.style.width = pct + '%';
+  swimProgressText.textContent = msg;
+}
+
+swimUploadBtn.addEventListener('click', () => doSwimUpload());
+
+async function doSwimUpload(extraFields = {}) {
+  const f = swimFileInput.files[0];
+  if (!f) return;
+  swimUploadBtn.disabled = true;
+  swimUploadStatus.textContent = '';
+  document.getElementById('swimColMappingWrap').style.display = 'none';
+  setSwimProgress(10, 'Uploading file…');
+
+  const fd = new FormData();
+  fd.append('file', f);
+  for (const [k, v] of Object.entries(extraFields)) fd.append(k, v);
+
+  try {
+    setSwimProgress(30, 'Querying SWIM API (1 call per unique PID — may take a moment)…');
+    const resp = await fetch('/swim/upload', { method: 'POST', body: fd });
+    const data = await resp.json();
+
+    if (data.needs_mapping && data.context === 'swim') {
+      swimProgressWrap.style.display = 'none';
+      const makeOpts = () => '<option value="">-- None --</option>' +
+        data.available_columns.map(c => `<option value="${c.replace(/"/g,'&quot;')}">${c}</option>`).join('');
+      document.getElementById('swimManualPidSel').innerHTML     = makeOpts();
+      document.getElementById('swimManualVersionSel').innerHTML = makeOpts();
+      document.getElementById('swimColMappingWrap').style.display = 'block';
+      return;
+    }
+    if (!resp.ok) {
+      swimUploadStatus.textContent = 'Error: ' + (data.error || 'Unknown');
+      swimProgressWrap.style.display = 'none';
+      return;
+    }
+
+    setSwimProgress(100, `Done — ${data.stats.total} rows processed (${data.stats.unique_pids} unique PIDs)`);
+
+    document.getElementById('swimColPid').textContent     = data.pid_col     ? `PID: "${data.pid_col}"`         : 'PID: not found';
+    document.getElementById('swimColVersion').textContent = data.version_col ? `Version: "${data.version_col}"` : 'Version: not detected';
+    document.getElementById('swimDetectedCols').style.display = 'block';
+
+    swimRows    = data.rows;
+    swimHeaders = data.headers;
+    swimEoxCols = data.swim_col_names;
+    swimPage    = 1;
+
+    renderSwimSummary(data.stats);
+    renderSwimTable();
+
+    document.getElementById('swimDownloadLink').href = `/swim/download/${data.job_id}`;
+    document.getElementById('swimDownloadBar').style.display = 'block';
+
+  } catch(err) {
+    swimUploadStatus.textContent = 'Error: ' + err.message;
+    swimProgressWrap.style.display = 'none';
+  } finally {
+    swimUploadBtn.disabled = false;
+  }
+}
+
+function swimResubmitWithMapping() {
+  const pidCol     = document.getElementById('swimManualPidSel').value;
+  const versionCol = document.getElementById('swimManualVersionSel').value;
+  if (!pidCol) { swimUploadStatus.textContent = 'Select at least the Product ID column.'; return; }
+  const extra = { pid_col: pidCol };
+  if (versionCol) extra.version_col = versionCol;
+  doSwimUpload(extra);
+}
+
+function renderSwimSummary(s) {
+  const bar = document.getElementById('swimSummaryBar');
+  bar.style.display = 'flex';
+  bar.innerHTML = `
+    <span class="pill pill-total">${s.total} Total Rows</span>
+    <span class="pill pill-c">${s.compliant} Compliant</span>
+    <span class="pill pill-nc">${s.non_compliant} Non-Compliant</span>
+    <span class="pill pill-uk">${s.unknown} Unknown</span>
+    <span class="pill pill-uk">${s.unique_pids} Unique PIDs</span>`;
+}
+
+function swimComplianceBadge(label) {
+  if (!label) return '<span class="badge-sm badge-sm-uk">Unknown</span>';
+  const l = label.toLowerCase();
+  if (l === 'compliant')     return `<span class="badge-sm badge-sm-c">${label}</span>`;
+  if (l === 'non-compliant') return `<span class="badge-sm badge-sm-nc">${label}</span>`;
+  return `<span class="badge-sm badge-sm-uk">${label}</span>`;
+}
+
+function renderSwimTable() {
+  document.getElementById('swimTableWrap').style.display = 'block';
+  const isSwim = col => swimEoxCols.includes(col);
+  document.getElementById('swimThead').innerHTML =
+    '<tr>' + swimHeaders.map(h => `<th class="${isSwim(h)?'eox-col':''}">${h}</th>`).join('') + '</tr>';
+  renderSwimPage(swimPage);
+}
+
+function renderSwimPage(page) {
+  swimPage = page;
+  const start = (page - 1) * PAGE_SIZE;
+  const slice = swimRows.slice(start, start + PAGE_SIZE);
+  const compCol = 'SWIM Compliance';
+  const dateCols = swimEoxCols.filter(c => c !== compCol);
+  document.getElementById('swimTbody').innerHTML = slice.map(row =>
+    '<tr>' + swimHeaders.map(h => {
+      const v = row[h];
+      if (h === compCol) return `<td>${swimComplianceBadge(v||'')}</td>`;
+      if (dateCols.includes(h)) return `<td class="${!v?'na':'mono'}">${v||'N/A'}</td>`;
+      const d = (v === null || v === undefined || v === '') ? '' : String(v);
+      return `<td title="${d.replace(/"/g,'&quot;')}">${d}</td>`;
+    }).join('') + '</tr>'
+  ).join('');
+  renderSwimPagination();
+}
+
+function renderSwimPagination() {
+  const total = swimRows.length;
+  const pages = Math.ceil(total / PAGE_SIZE);
+  const pg = document.getElementById('swimPagination');
+  if (pages <= 1) { pg.innerHTML = ''; return; }
+  let html = `<span class="page-info-txt">Rows ${(swimPage-1)*PAGE_SIZE+1}–${Math.min(swimPage*PAGE_SIZE,total)} of ${total}</span>`;
+  if (swimPage > 1) html += `<button class="page-btn" onclick="renderSwimPage(${swimPage-1})">‹ Prev</button>`;
+  const s2 = Math.max(1, swimPage-3), e2 = Math.min(pages, swimPage+3);
+  for (let i = s2; i <= e2; i++)
+    html += `<button class="page-btn${i===swimPage?' active':''}" onclick="renderSwimPage(${i})">${i}</button>`;
+  if (swimPage < pages) html += `<button class="page-btn" onclick="renderSwimPage(${swimPage+1})">Next ›</button>`;
+  pg.innerHTML = html;
+}
 </script>
 </body>
 </html>
@@ -943,6 +1303,105 @@ def download(job_id):
         buf,
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         download_name="cisco_eox_enriched.xlsx",
+        as_attachment=True,
+    )
+
+
+@app.route("/swim/search", methods=["POST"])
+def swim_search():
+    data = request.get_json(force=True)
+    pid = (data.get("pid") or "").strip()
+    if not pid:
+        return jsonify({"error": "Provide a Product ID"}), 400
+    if "*" in pid or "," in pid:
+        return jsonify({"error": "SWIM requires a single exact PID — wildcards and comma-separated lists are not supported"}), 400
+    try:
+        result = cisco_swim.query_all_pages_swim_by_pid(pid)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 500
+    except Exception as e:
+        return jsonify({"error": f"API error: {e}"}), 502
+    return jsonify({"result": result})
+
+
+@app.route("/swim/upload", methods=["POST"])
+def swim_upload():
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "Empty filename"}), 400
+
+    fname = f.filename.lower()
+    try:
+        df = pd.read_csv(f, dtype=str) if fname.endswith(".csv") else pd.read_excel(f, dtype=str)
+    except Exception as e:
+        return jsonify({"error": f"Could not read file: {e}"}), 400
+    df = df.fillna("")
+
+    pid_col     = request.form.get("pid_col", "").strip()     or _find_col(df, PID_KEYWORDS)
+    version_col = request.form.get("version_col", "").strip() or _find_col(df, SWIM_VERSION_KEYWORDS)
+
+    if not pid_col:
+        return jsonify({"needs_mapping": True, "available_columns": list(df.columns), "context": "swim"})
+
+    unique_pids = [str(v).strip() for v in df[pid_col].unique() if str(v).strip()]
+    try:
+        swim_lookup = _build_swim_lookup(unique_pids)
+    except Exception as e:
+        return jsonify({"error": f"SWIM API error: {e}"}), 502
+
+    swim_col_names = [c[0] for c in SWIM_COLS]
+    for col_name in swim_col_names:
+        df[col_name] = ""
+
+    for idx, row in df.iterrows():
+        pid_val = str(row[pid_col]).strip().upper()
+        rec = swim_lookup.get(pid_val) or {}
+        suggested = rec.get("suggested_release", "")
+        lifecycle  = rec.get("lifecycle", "")
+        df.at[idx, "SWIM Suggested Release"] = suggested
+        df.at[idx, "SWIM Lifecycle"]         = lifecycle
+        if version_col:
+            df.at[idx, "SWIM Compliance"] = cisco_swim._swim_compliance(
+                str(row[version_col]), suggested
+            )
+
+    compliance_col = df["SWIM Compliance"]
+    stats = {
+        "total":        len(df),
+        "unique_pids":  len(unique_pids),
+        "compliant":    int((compliance_col == "Compliant").sum()),
+        "non_compliant":int((compliance_col == "Non-Compliant").sum()),
+        "unknown":      int(((compliance_col == "") | (compliance_col == "Unknown")).sum()),
+    }
+
+    job_id = str(uuid.uuid4())[:8]
+    _store_job(job_id, df)
+
+    return jsonify({
+        "job_id":          job_id,
+        "pid_col":         pid_col,
+        "version_col":     version_col,
+        "headers":         list(df.columns),
+        "swim_col_names":  swim_col_names,
+        "rows":            df.to_dict(orient="records"),
+        "stats":           stats,
+    })
+
+
+@app.route("/swim/download/<job_id>")
+def swim_download(job_id: str):
+    df = _load_job(job_id)
+    if df is None:
+        return "Job not found or expired", 404
+    buf = io.BytesIO()
+    df.to_excel(buf, index=False, engine="openpyxl")
+    buf.seek(0)
+    return send_file(
+        buf,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        download_name="cisco_swim_enriched.xlsx",
         as_attachment=True,
     )
 
