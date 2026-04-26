@@ -193,11 +193,31 @@ def query_by_serial_number(sn: str, page: int = 1) -> dict:
     return {"query_type": "serial_number", "query": sn, "pagination": pagination, "records": records}
 
 
+def query_all_pages_by_product_id(pid: str) -> dict:
+    """
+    Query all pages for a Product ID (useful for wildcard queries).
+    Walks pages 1..last_page and returns all records combined.
+    """
+    first = query_by_product_id(pid, page=1)
+    all_records = list(first["records"])
+    last_page = first["pagination"]["last_page"]
+    for page in range(2, last_page + 1):
+        result = query_by_product_id(pid, page=page)
+        all_records.extend(result["records"])
+    return {
+        "query_type": "product_id",
+        "query": pid,
+        "pagination": {**first["pagination"], "page": 1},
+        "records": all_records,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Cisco EOX V5 API Tool")
     parser.add_argument("--pid", help="Product ID (supports wildcards and comma-separated list)")
     parser.add_argument("--sn", help="Serial Number (comma-separated list)")
     parser.add_argument("--page", type=int, default=1, help="Page index (default: 1)")
+    parser.add_argument("--all-pages", action="store_true", help="Fetch all pages (useful for wildcard queries)")
     parser.add_argument("--json", action="store_true", help="Output raw JSON")
     args = parser.parse_args()
 
@@ -206,7 +226,10 @@ def main():
 
     results = []
     if args.pid:
-        results.append(query_by_product_id(args.pid, args.page))
+        if args.all_pages:
+            results.append(query_all_pages_by_product_id(args.pid))
+        else:
+            results.append(query_by_product_id(args.pid, args.page))
     if args.sn:
         results.append(query_by_serial_number(args.sn, args.page))
 

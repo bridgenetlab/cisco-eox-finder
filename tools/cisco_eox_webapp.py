@@ -50,7 +50,7 @@ EOX_COLS = [
     ("EOX Migration PID",            "migration_product_id"),
 ]
 
-# ── Batched PID lookup ───────────────────────────────────────────────────────
+# ── Batched lookups ──────────────────────────────────────────────────────────
 def _build_pid_lookup(pids: list[str]) -> dict[str, dict]:
     """Query EOX API for a list of unique PIDs (batched 20 at a time)."""
     lookup: dict[str, dict] = {}
@@ -63,6 +63,21 @@ def _build_pid_lookup(pids: list[str]) -> dict[str, dict]:
         for rec in result.get("records", []):
             if "error" not in rec:
                 lookup[rec["product_id"].upper()] = rec
+    return lookup
+
+
+def _build_sn_lookup(sns: list[str]) -> dict[str, dict]:
+    """Query EOX API for a list of unique SNs (batched 20 at a time, mapped by position)."""
+    lookup: dict[str, dict] = {}
+    batch_size = 20
+    for i in range(0, len(sns), batch_size):
+        batch = [s for s in sns[i:i + batch_size] if s]
+        if not batch:
+            continue
+        result = cisco_eox.query_by_serial_number(",".join(batch))
+        for j, rec in enumerate(result.get("records", [])):
+            if j < len(batch) and "error" not in rec:
+                lookup[batch[j].upper()] = rec
     return lookup
 
 # ── HTML ─────────────────────────────────────────────────────────────────────
@@ -308,8 +323,8 @@ td.na { color: #484f58; font-style: italic; }
     <div class="drop-zone" id="dropZone">
       <div class="drop-icon">📊</div>
       <p>Drag &amp; drop your Excel file here, or click to browse</p>
-      <p style="font-size:0.75rem;color:#6e7681">.xlsx files · auto-detects "Product Part" and "Serial Number" columns</p>
-      <input type="file" id="fileInput" accept=".xlsx,.xls" style="display:none">
+      <p style="font-size:0.75rem;color:#6e7681">.xlsx / .csv · auto-detects "Product Part" and "Serial Number" columns</p>
+      <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" style="display:none">
     </div>
 
     <div id="detectedCols" style="display:none;margin-bottom:1rem;">
@@ -510,7 +525,11 @@ uploadBtn.addEventListener('click', async () => {
     const data = await resp.json();
     if (!resp.ok) { uploadStatus.textContent = 'Error: ' + (data.error || 'Unknown'); progressWrap.style.display='none'; return; }
 
-    setProgress(100, `Done — ${data.stats.total} rows processed (${data.stats.unique_pids} unique PIDs)`);
+    const lookupSummary = [
+      data.stats.unique_pids ? `${data.stats.unique_pids} unique PIDs` : '',
+      data.stats.unique_sns  ? `${data.stats.unique_sns} unique SNs`  : '',
+    ].filter(Boolean).join(', ');
+    setProgress(100, `Done — ${data.stats.total} rows processed (${lookupSummary})`);
 
     // Show detected columns
     document.getElementById('colPid').textContent = data.pid_col ? `PID: "${data.pid_col}"` : 'PID: not found';
@@ -545,7 +564,8 @@ function renderSummary(s) {
     <span class="pill pill-w">${s.warning} Warning</span>
     <span class="pill pill-nc">${s.noncompliant} Noncompliant</span>
     ${s.unknown ? `<span class="pill pill-uk">${s.unknown} Unknown</span>` : ''}
-    <span class="pill pill-uk">${s.unique_pids} Unique PIDs</span>`;
+    ${s.unique_pids ? `<span class="pill pill-uk">${s.unique_pids} Unique PIDs</span>` : ''}
+    ${s.unique_sns  ? `<span class="pill pill-uk">${s.unique_sns} Unique SNs</span>`  : ''}`;
 }
 
 function complianceBadgeSm(label) {
@@ -633,7 +653,11 @@ def search():
         return jsonify({"error": "Provide a Product ID or Serial Number"}), 400
     results = []
     try:
-        if pid: results.append(cisco_eox.query_by_product_id(pid))
+        if pid:
+            if "*" in pid:
+                results.append(cisco_eox.query_all_pages_by_product_id(pid))
+            else:
+                results.append(cisco_eox.query_by_product_id(pid))
         if sn:  results.append(cisco_eox.query_by_serial_number(sn))
     except ValueError as e:
         return jsonify({"error": str(e)}), 500
@@ -651,11 +675,15 @@ def upload():
     if not f.filename:
         return jsonify({"error": "Empty filename"}), 400
 
-    # Read Excel
+    # Read file (Excel or CSV)
+    fname = f.filename.lower()
     try:
-        df = pd.read_excel(f, dtype=str)
+        if fname.endswith(".csv"):
+            df = pd.read_csv(f, dtype=str)
+        else:
+            df = pd.read_excel(f, dtype=str)
     except Exception as e:
-        return jsonify({"error": f"Could not read Excel: {e}"}), 400
+        return jsonify({"error": f"Could not read file: {e}"}), 400
 
     df = df.fillna("")
 
@@ -667,15 +695,20 @@ def upload():
         return jsonify({"error": "Could not find 'Product Part' or 'Serial Number' column. "
                                  "Please ensure your Excel has these column headers."}), 400
 
-    # Build EOX lookup from unique PIDs
+    # Build EOX lookup from unique PIDs and/or SNs
     pid_lookup: dict = {}
+    sn_lookup: dict = {}
     unique_pids: list = []
-    if pid_col:
-        unique_pids = [str(v).strip() for v in df[pid_col].unique() if str(v).strip()]
-        try:
+    unique_sns: list = []
+    try:
+        if pid_col:
+            unique_pids = [str(v).strip() for v in df[pid_col].unique() if str(v).strip()]
             pid_lookup = _build_pid_lookup(unique_pids)
-        except Exception as e:
-            return jsonify({"error": f"EOX API error: {e}"}), 502
+        if sn_col:
+            unique_sns = [str(v).strip() for v in df[sn_col].unique() if str(v).strip()]
+            sn_lookup = _build_sn_lookup(unique_sns)
+    except Exception as e:
+        return jsonify({"error": f"EOX API error: {e}"}), 502
 
     # Add EOX columns to DataFrame
     eox_col_names = [c[0] for c in EOX_COLS]
@@ -685,8 +718,9 @@ def upload():
     for idx, row in df.iterrows():
         rec = None
         if pid_col:
-            pid_val = str(row[pid_col]).strip().upper()
-            rec = pid_lookup.get(pid_val)
+            rec = pid_lookup.get(str(row[pid_col]).strip().upper())
+        if rec is None and sn_col:
+            rec = sn_lookup.get(str(row[sn_col]).strip().upper())
 
         if rec:
             df.at[idx, "EOX End of Sale"]             = rec.get("end_of_sale", "")
@@ -700,12 +734,13 @@ def upload():
     # Stats
     compliance_col = df["EOX Compliance"]
     stats = {
-        "total":       len(df),
-        "unique_pids": len(unique_pids),
-        "compliant":   int((compliance_col == "Compliant").sum()),
-        "warning":     int((compliance_col == "Compliant with Warning").sum()),
-        "noncompliant":int((compliance_col == "Noncompliant").sum()),
-        "unknown":     int((compliance_col == "").sum()),
+        "total":        len(df),
+        "unique_pids":  len(unique_pids),
+        "unique_sns":   len(unique_sns),
+        "compliant":    int((compliance_col == "Compliant").sum()),
+        "warning":      int((compliance_col == "Compliant with Warning").sum()),
+        "noncompliant": int((compliance_col == "Noncompliant").sum()),
+        "unknown":      int((compliance_col == "").sum()),
     }
 
     # Store enriched df for download
