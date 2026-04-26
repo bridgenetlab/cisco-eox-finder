@@ -10,6 +10,7 @@ Run:
 """
 
 import io
+import os
 import pickle
 import sqlite3
 import sys
@@ -40,6 +41,16 @@ def _db():
         "CREATE TABLE IF NOT EXISTS jobs "
         "(job_id TEXT PRIMARY KEY, data BLOB NOT NULL, created_at INTEGER NOT NULL)"
     )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS saved_lists "
+        "(list_id TEXT PRIMARY KEY, name TEXT NOT NULL, "
+        "columns_json TEXT NOT NULL, rows_json TEXT NOT NULL, created_at INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS job_meta "
+        "(job_id TEXT PRIMARY KEY, job_type TEXT NOT NULL, "
+        "stats_json TEXT NOT NULL, created_at INTEGER NOT NULL)"
+    )
     conn.commit()
     return conn
 
@@ -57,6 +68,77 @@ def _load_job(job_id: str) -> pd.DataFrame | None:
     with _db() as conn:
         row = conn.execute("SELECT data FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
     return pickle.loads(row[0]) if row else None
+
+# ── Job metadata (for dashboard) ─────────────────────────────────────────────
+def _record_job_meta(job_id: str, job_type: str, stats: dict) -> None:
+    import json as _json
+    with _db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO job_meta (job_id, job_type, stats_json, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (job_id, job_type, _json.dumps(stats), int(time.time())),
+        )
+        conn.execute("DELETE FROM job_meta WHERE created_at < ?", (int(time.time()) - 90 * 86400,))
+
+# ── Saved device lists ───────────────────────────────────────────────────────
+def _list_saved_lists() -> list[dict]:
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT list_id, name, columns_json, rows_json, created_at "
+            "FROM saved_lists ORDER BY created_at DESC"
+        ).fetchall()
+    import json as _json
+    return [
+        {"list_id": r[0], "name": r[1],
+         "columns": _json.loads(r[2]), "rows": _json.loads(r[3]),
+         "created_at": r[4]}
+        for r in rows
+    ]
+
+
+def _save_list(name: str, columns: list, rows: list) -> str:
+    import json as _json
+    list_id = str(uuid.uuid4())[:8]
+    with _db() as conn:
+        conn.execute(
+            "INSERT INTO saved_lists (list_id, name, columns_json, rows_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (list_id, name, _json.dumps(columns), _json.dumps(rows), int(time.time())),
+        )
+    return list_id
+
+
+def _delete_saved_list(list_id: str) -> bool:
+    with _db() as conn:
+        cur = conn.execute("DELETE FROM saved_lists WHERE list_id = ?", (list_id,))
+    return cur.rowcount > 0
+
+# ── Webhook alerts ───────────────────────────────────────────────────────────
+_WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
+
+
+def _send_webhook_alert(job_type: str, stats: dict, job_id: str) -> None:
+    """POST a Slack/Teams-compatible alert when non-compliant devices are found."""
+    if not _WEBHOOK_URL:
+        return
+    non_compliant = (
+        stats.get("non_compliant") or stats.get("noncompliant")
+        or stats.get("psirt_non_compliant") or 0
+    )
+    if not non_compliant:
+        return
+    try:
+        import requests as _req
+        total = stats.get("total", 0)
+        label = job_type.upper()
+        text = (
+            f":rotating_light: *{label} Alert* — {non_compliant} of {total} rows "
+            f"are Non-Compliant (Job `{job_id}`)"
+        )
+        # Slack uses {"text":...}; Teams uses {"text":...} too via Incoming Webhook
+        _req.post(_WEBHOOK_URL, json={"text": text}, timeout=5)
+    except Exception as exc:
+        print(f"Webhook send failed: {exc}", file=sys.stderr)
 
 # ── Column-name detection ────────────────────────────────────────────────────
 PID_KEYWORDS = ["product part", "product_part", "productpart", "pid",
@@ -430,6 +512,7 @@ thead th.psirt-col { color: #f85149; }
   <button class="tab-btn" data-tab="swim">SWIM</button>
   <button class="tab-btn" data-tab="psirt">PSIRT</button>
   <button class="tab-btn" data-tab="unified">Unified Report</button>
+  <button class="tab-btn" data-tab="dashboard">Dashboard</button>
 </div>
 
 <!-- ── Single Search ── -->
@@ -514,6 +597,8 @@ thead th.psirt-col { color: #f85149; }
 
   <div id="bulkDownloadBar" style="max-width:1200px;margin:0 auto 1rem;display:none">
     <a id="downloadLink" class="btn-green" href="#">⬇ Download Enriched Excel</a>
+    <a id="downloadHtmlLink" class="btn-secondary" href="#" target="_blank" style="margin-left:0.5rem">⎙ HTML Report</a>
+    <button class="btn-secondary" onclick="saveCurrentList('eox')" style="margin-left:0.5rem">💾 Save List</button>
     <span style="font-size:0.8rem;color:#6e7681;margin-left:0.75rem">Includes all original columns + EOX dates</span>
   </div>
 
@@ -523,6 +608,14 @@ thead th.psirt-col { color: #f85149; }
       <tbody id="bulkTbody"></tbody>
     </table>
     <div class="pagination" id="pagination"></div>
+  </div>
+
+  <!-- Saved Lists -->
+  <div class="card" id="savedListsCard">
+    <h2>Saved Device Lists</h2>
+    <div id="savedListsWrap">
+      <p style="color:#6e7681;font-size:0.85rem">No saved lists yet. After processing a file, click <strong>💾 Save List</strong> to save it for quick reload.</p>
+    </div>
   </div>
 </div>
 
@@ -588,6 +681,8 @@ thead th.psirt-col { color: #f85149; }
   <div id="swimSummaryBar"  class="summary-bar"                        style="display:none"></div>
   <div id="swimDownloadBar" style="max-width:1200px;margin:0 auto 1rem;display:none">
     <a id="swimDownloadLink" class="btn-green" href="#">⬇ Download Enriched Excel</a>
+    <a id="swimDownloadHtmlLink" class="btn-secondary" href="#" target="_blank" style="margin-left:0.5rem">⎙ HTML Report</a>
+    <button class="btn-secondary" onclick="saveCurrentList('swim')" style="margin-left:0.5rem">💾 Save List</button>
     <span style="font-size:0.8rem;color:#6e7681;margin-left:0.75rem">Includes all original columns + SWIM suggested release + compliance</span>
   </div>
   <div id="swimTableWrap" class="table-wrap" style="display:none">
@@ -682,6 +777,8 @@ thead th.psirt-col { color: #f85149; }
   <div id="psirtSummaryBar"  class="summary-bar"                        style="display:none"></div>
   <div id="psirtDownloadBar" style="max-width:1200px;margin:0 auto 1rem;display:none">
     <a id="psirtDownloadLink" class="btn-green" href="#">⬇ Download Enriched Excel</a>
+    <a id="psirtDownloadHtmlLink" class="btn-secondary" href="#" target="_blank" style="margin-left:0.5rem">⎙ HTML Report</a>
+    <button class="btn-secondary" onclick="saveCurrentList('psirt')" style="margin-left:0.5rem">💾 Save List</button>
     <span style="font-size:0.8rem;color:#6e7681;margin-left:0.75rem">Includes all original columns + PSIRT advisory data</span>
   </div>
   <div id="psirtTableWrap" class="table-wrap" style="display:none">
@@ -748,6 +845,8 @@ thead th.psirt-col { color: #f85149; }
   <div id="unifiedSummaryBar"  class="summary-bar"                        style="display:none"></div>
   <div id="unifiedDownloadBar" style="max-width:1200px;margin:0 auto 1rem;display:none">
     <a id="unifiedDownloadLink" class="btn-green" href="#">⬇ Download Unified Report</a>
+    <a id="unifiedDownloadHtmlLink" class="btn-secondary" href="#" target="_blank" style="margin-left:0.5rem">⎙ HTML Report</a>
+    <button class="btn-secondary" onclick="saveCurrentList('unified')" style="margin-left:0.5rem">💾 Save List</button>
     <span style="font-size:0.8rem;color:#6e7681;margin-left:0.75rem">Includes all original columns + EOX · Coverage · SWIM · PSIRT data</span>
   </div>
   <div id="unifiedTableWrap" class="table-wrap" style="display:none">
@@ -755,6 +854,38 @@ thead th.psirt-col { color: #f85149; }
     <div class="pagination" id="unifiedPagination"></div>
   </div>
 </div>
+
+<!-- ── Dashboard Tab ── -->
+<div id="tab-dashboard" class="tab-panel">
+  <div class="card">
+    <h2>Compliance Dashboard</h2>
+    <p style="font-size:0.85rem;color:#8b949e;margin:0 0 1.5rem">Aggregate view across all processed jobs (last 90).</p>
+    <div id="dashboardEmpty" style="color:#6e7681;font-size:0.85rem">No jobs recorded yet. Process a file from any tab to see data here.</div>
+    <div id="dashboardCharts" style="display:none">
+      <div style="display:flex;gap:2rem;flex-wrap:wrap;margin-bottom:2rem">
+        <div style="flex:1;min-width:260px;max-width:340px">
+          <h3 style="font-size:0.9rem;color:#8b949e;margin-bottom:0.75rem">EOX Compliance (all EOX jobs)</h3>
+          <canvas id="dashEoxDonut" height="200"></canvas>
+        </div>
+        <div style="flex:1;min-width:260px;max-width:340px">
+          <h3 style="font-size:0.9rem;color:#8b949e;margin-bottom:0.75rem">PSIRT Compliance (all PSIRT / Unified jobs)</h3>
+          <canvas id="dashPsirtDonut" height="200"></canvas>
+        </div>
+        <div style="flex:1;min-width:260px;max-width:340px">
+          <h3 style="font-size:0.9rem;color:#8b949e;margin-bottom:0.75rem">Coverage Status (all Unified jobs)</h3>
+          <canvas id="dashCovDonut" height="200"></canvas>
+        </div>
+      </div>
+      <div style="margin-bottom:2rem">
+        <h3 style="font-size:0.9rem;color:#8b949e;margin-bottom:0.75rem">Jobs Over Time (rows processed per upload)</h3>
+        <canvas id="dashTrendBar" height="120"></canvas>
+      </div>
+      <div id="dashJobTable" style="overflow-x:auto"></div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
 
 <script>
 // ── Tab switching ────────────────────────────────────────────────────────────
@@ -957,7 +1088,8 @@ async function doUpload(extraFields = {}) {
     renderChart(data.stats);
     renderBulkTable();
 
-    document.getElementById('downloadLink').href = `/download/${data.job_id}`;
+    document.getElementById('downloadLink').href     = `/download/${data.job_id}`;
+    document.getElementById('downloadHtmlLink').href = `/html/${data.job_id}`;
     document.getElementById('bulkDownloadBar').style.display = 'block';
 
   } catch(err) {
@@ -1301,7 +1433,8 @@ async function doSwimUpload(extraFields = {}) {
     renderSwimSummary(data.stats);
     renderSwimTable();
 
-    document.getElementById('swimDownloadLink').href = `/swim/download/${data.job_id}`;
+    document.getElementById('swimDownloadLink').href     = `/swim/download/${data.job_id}`;
+    document.getElementById('swimDownloadHtmlLink').href = `/swim/html/${data.job_id}`;
     document.getElementById('swimDownloadBar').style.display = 'block';
 
   } catch(err) {
@@ -1583,7 +1716,8 @@ async function doPsirtUpload(extraFields = {}) {
     renderPsirtSummary(data.stats);
     renderPsirtTable();
 
-    document.getElementById('psirtDownloadLink').href = `/psirt/download/${data.job_id}`;
+    document.getElementById('psirtDownloadLink').href     = `/psirt/download/${data.job_id}`;
+    document.getElementById('psirtDownloadHtmlLink').href = `/psirt/html/${data.job_id}`;
     document.getElementById('psirtDownloadBar').style.display = 'block';
 
   } catch(err) {
@@ -1760,7 +1894,8 @@ async function doUnifiedUpload(extraFields = {}) {
     renderUnifiedSummary(data.stats);
     renderUnifiedTable();
 
-    document.getElementById('unifiedDownloadLink').href = `/unified/download/${data.job_id}`;
+    document.getElementById('unifiedDownloadLink').href     = `/unified/download/${data.job_id}`;
+    document.getElementById('unifiedDownloadHtmlLink').href = `/unified/html/${data.job_id}`;
     document.getElementById('unifiedDownloadBar').style.display = 'block';
 
   } catch(err) {
@@ -1873,6 +2008,219 @@ function renderUnifiedPagination() {
     html += `<button class="page-btn${i===unifiedPage?' active':''}" onclick="renderUnifiedPage(${i})">${i}</button>`;
   if (unifiedPage < pages) html += `<button class="page-btn" onclick="renderUnifiedPage(${unifiedPage+1})">Next ›</button>`;
   pg.innerHTML = html;
+}
+
+// ── Saved Device Lists ────────────────────────────────────────────────────────
+// Each tab stores its current rows/headers in these module-level vars so Save works globally.
+// EOX bulk: bulkRows / bulkHeaders (already defined above)
+// Others reuse their own rows vars.
+
+async function loadSavedLists() {
+  try {
+    const resp = await fetch('/lists');
+    const lists = await resp.json();
+    renderSavedLists(lists);
+  } catch(e) { /* silent */ }
+}
+
+function renderSavedLists(lists) {
+  const wrap = document.getElementById('savedListsWrap');
+  if (!lists.length) {
+    wrap.innerHTML = '<p style="color:#6e7681;font-size:0.85rem">No saved lists yet. After processing a file, click <strong>💾 Save List</strong> to save it for quick reload.</p>';
+    return;
+  }
+  wrap.innerHTML = lists.map(l => {
+    const date = new Date(l.created_at * 1000).toLocaleString();
+    return `<div style="display:flex;align-items:center;gap:0.75rem;padding:0.5rem 0;border-bottom:1px solid #21262d">
+      <span style="flex:1;color:#c9d1d9;font-size:0.85rem">${l.name}</span>
+      <span style="color:#6e7681;font-size:0.75rem">${l.rows.length} rows · ${date}</span>
+      <button class="btn-secondary" style="padding:0.2rem 0.6rem;font-size:0.75rem"
+        onclick="loadSavedListIntoTab('${l.list_id}')">Load</button>
+      <button class="btn-secondary" style="padding:0.2rem 0.6rem;font-size:0.75rem;color:#f85149"
+        onclick="deleteSavedList('${l.list_id}')">✕</button>
+    </div>`;
+  }).join('');
+}
+
+async function saveCurrentList(tabType) {
+  let rows, headers;
+  if (tabType === 'eox')    { rows = bulkRows;    headers = bulkHeaders; }
+  else if (tabType === 'swim')   { rows = swimRows;    headers = swimHeaders; }
+  else if (tabType === 'psirt')  { rows = psirtRows;   headers = psirtHeaders; }
+  else if (tabType === 'unified'){ rows = unifiedRows; headers = unifiedHeaders; }
+  if (!rows || !rows.length) { alert('No data to save.'); return; }
+  const name = prompt('Save list as:');
+  if (!name) return;
+  const resp = await fetch('/lists/save', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({name, columns: headers, rows}),
+  });
+  const data = await resp.json();
+  if (data.error) { alert('Error: ' + data.error); return; }
+  loadSavedLists();
+}
+
+async function deleteSavedList(listId) {
+  if (!confirm('Delete this saved list?')) return;
+  await fetch(`/lists/${listId}`, {method: 'DELETE'});
+  loadSavedLists();
+}
+
+function loadSavedListIntoTab(listId) {
+  // Navigate to the bulk tab and display the saved list data
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  document.querySelector('.tab-btn[data-tab="bulk"]').classList.add('active');
+  document.getElementById('tab-bulk').classList.add('active');
+
+  fetch('/lists').then(r => r.json()).then(lists => {
+    const list = lists.find(l => l.list_id === listId);
+    if (!list) return;
+    bulkRows    = list.rows;
+    bulkHeaders = list.columns;
+    eoxColNames = [];
+    currentPage = 1;
+    renderBulkTable();
+    document.getElementById('bulkSummaryBar').style.display = 'none';
+    document.getElementById('bulkDownloadBar').style.display = 'none';
+    document.getElementById('bulkTableWrap').style.display = 'block';
+  });
+}
+
+// Load saved lists on page load
+loadSavedLists();
+
+// ── Compliance Dashboard ──────────────────────────────────────────────────────
+let _dashCharts = {};
+
+document.querySelector('.tab-btn[data-tab="dashboard"]').addEventListener('click', loadDashboard);
+
+async function loadDashboard() {
+  try {
+    const resp = await fetch('/dashboard/data');
+    const jobs = await resp.json();
+    renderDashboard(jobs);
+  } catch(e) {
+    document.getElementById('dashboardEmpty').textContent = 'Failed to load dashboard data.';
+  }
+}
+
+function renderDashboard(jobs) {
+  const empty = document.getElementById('dashboardEmpty');
+  const charts = document.getElementById('dashboardCharts');
+  if (!jobs.length) { empty.style.display = 'block'; charts.style.display = 'none'; return; }
+  empty.style.display = 'none';
+  charts.style.display = 'block';
+
+  // Aggregate EOX compliance
+  let eoxC = 0, eoxW = 0, eoxNC = 0, eoxU = 0;
+  // Aggregate PSIRT compliance
+  let psirtC = 0, psirtNC = 0, psirtNA = 0;
+  // Aggregate Coverage
+  let covA = 0, covI = 0, covU = 0;
+
+  const trend = jobs.slice(0, 30).reverse().map(j => ({
+    label: `${j.job_type.toUpperCase()} ${new Date(j.created_at*1000).toLocaleDateString()}`,
+    total: j.stats.total || 0,
+    type: j.job_type,
+  }));
+
+  for (const j of jobs) {
+    const s = j.stats;
+    if (j.job_type === 'eox' || j.job_type === 'unified') {
+      eoxC  += (s.compliant     || 0);
+      eoxW  += (s.warning       || 0);
+      eoxNC += (s.noncompliant  || s.non_compliant || 0);
+      eoxU  += (s.unknown       || 0);
+    }
+    if (j.job_type === 'psirt' || j.job_type === 'unified') {
+      psirtC  += (s.compliant       || s.psirt_compliant    || 0);
+      psirtNC += (s.non_compliant   || s.psirt_non_compliant|| 0);
+      psirtNA += (s.na              || s.psirt_na           || 0);
+    }
+    if (j.job_type === 'unified') {
+      covA += (s.coverage_active   || 0);
+      covI += (s.coverage_inactive || 0);
+      covU += (s.coverage_unknown  || 0);
+    }
+  }
+
+  const donutOpts = (labels, data, colors) => ({
+    type: 'doughnut',
+    data: { labels, datasets: [{ data, backgroundColor: colors, borderWidth: 1, borderColor: '#0d1117' }] },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { labels: { color: '#8b949e', font: { size: 11 } } }
+      }
+    }
+  });
+
+  const rebuildChart = (id, cfg) => {
+    if (_dashCharts[id]) _dashCharts[id].destroy();
+    _dashCharts[id] = new Chart(document.getElementById(id), cfg);
+  };
+
+  rebuildChart('dashEoxDonut', donutOpts(
+    ['Compliant', 'Warning', 'Non-Compliant', 'Unknown'],
+    [eoxC, eoxW, eoxNC, eoxU],
+    ['#3fb950', '#e3b341', '#f85149', '#6e7681']
+  ));
+
+  rebuildChart('dashPsirtDonut', donutOpts(
+    ['Compliant', 'Non-Compliant', 'NA'],
+    [psirtC, psirtNC, psirtNA],
+    ['#3fb950', '#f85149', '#6e7681']
+  ));
+
+  rebuildChart('dashCovDonut', donutOpts(
+    ['Active', 'Inactive', 'Unknown'],
+    [covA, covI, covU],
+    ['#3fb950', '#f85149', '#6e7681']
+  ));
+
+  const typeColor = t => t === 'eox' ? '#58a6ff' : t === 'psirt' ? '#f85149' : t === 'swim' ? '#e3b341' : '#3fb950';
+  rebuildChart('dashTrendBar', {
+    type: 'bar',
+    data: {
+      labels: trend.map(t => t.label),
+      datasets: [{
+        label: 'Rows processed',
+        data: trend.map(t => t.total),
+        backgroundColor: trend.map(t => typeColor(t.type)),
+        borderRadius: 3,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: {
+        x: { ticks: { color: '#6e7681', maxRotation: 45, font: { size: 10 } }, grid: { color: '#21262d' } },
+        y: { ticks: { color: '#6e7681' }, grid: { color: '#21262d' }, beginAtZero: true }
+      },
+      plugins: { legend: { display: false } }
+    }
+  });
+
+  // Job history table
+  const TYPE_COLOR = { eox: '#58a6ff', swim: '#e3b341', psirt: '#f85149', unified: '#3fb950' };
+  document.getElementById('dashJobTable').innerHTML = `
+    <h3 style="font-size:0.9rem;color:#8b949e;margin-bottom:0.75rem">Recent Jobs</h3>
+    <table style="width:100%;border-collapse:collapse;font-size:0.78rem">
+      <thead><tr>
+        <th style="text-align:left;padding:0.4rem 0.6rem;color:#8b949e;border-bottom:1px solid #30363d">Job ID</th>
+        <th style="text-align:left;padding:0.4rem 0.6rem;color:#8b949e;border-bottom:1px solid #30363d">Type</th>
+        <th style="text-align:left;padding:0.4rem 0.6rem;color:#8b949e;border-bottom:1px solid #30363d">Date</th>
+        <th style="text-align:right;padding:0.4rem 0.6rem;color:#8b949e;border-bottom:1px solid #30363d">Rows</th>
+      </tr></thead>
+      <tbody>
+        ${jobs.slice(0, 20).map(j => `<tr style="border-bottom:1px solid #21262d">
+          <td style="padding:0.4rem 0.6rem;font-family:monospace;color:#8b949e">${j.job_id}</td>
+          <td style="padding:0.4rem 0.6rem"><span style="background:${TYPE_COLOR[j.job_type]||'#555'}22;color:${TYPE_COLOR[j.job_type]||'#aaa'};padding:0.15rem 0.5rem;border-radius:3px;font-size:0.75rem">${j.job_type.toUpperCase()}</span></td>
+          <td style="padding:0.4rem 0.6rem;color:#8b949e">${new Date(j.created_at*1000).toLocaleString()}</td>
+          <td style="padding:0.4rem 0.6rem;text-align:right;color:#c9d1d9">${j.stats.total||0}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table>`;
 }
 </script>
 </body>
@@ -1991,6 +2339,8 @@ def upload():
     # Persist enriched df for download
     job_id = str(uuid.uuid4())[:8]
     _store_job(job_id, df)
+    _send_webhook_alert("eox", stats, job_id)
+    _record_job_meta(job_id, "eox", stats)
 
     # Return rows as list of dicts
     rows = df.to_dict(orient="records")
@@ -2021,6 +2371,105 @@ def download(job_id):
         download_name="cisco_eox_enriched.xlsx",
         as_attachment=True,
     )
+
+
+@app.route("/html/<job_id>")
+def eox_html(job_id: str):
+    df = _load_job(job_id)
+    if df is None:
+        return "Job not found or expired", 404
+    return _generate_html_report(df, "EOX Compliance Report"), 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+@app.route("/swim/html/<job_id>")
+def swim_html(job_id: str):
+    df = _load_job(job_id)
+    if df is None:
+        return "Job not found or expired", 404
+    return _generate_html_report(df, "SWIM Software Report"), 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+@app.route("/psirt/html/<job_id>")
+def psirt_html(job_id: str):
+    df = _load_job(job_id)
+    if df is None:
+        return "Job not found or expired", 404
+    return _generate_html_report(df, "PSIRT Security Report"), 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+@app.route("/unified/html/<job_id>")
+def unified_html(job_id: str):
+    df = _load_job(job_id)
+    if df is None:
+        return "Job not found or expired", 404
+    return _generate_html_report(df, "Unified Compliance Report"), 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+def _generate_html_report(df: pd.DataFrame, title: str) -> str:
+    """Generate a self-contained, printable HTML compliance report from a job DataFrame."""
+    COMPLIANCE_COLS = {
+        "EOX Compliance", "SWIM Compliance", "PSIRT Compliance", "Coverage Status"
+    }
+
+    def _cell_style(col: str, val: str) -> str:
+        if col not in COMPLIANCE_COLS or not val:
+            return ""
+        v = val.lower()
+        if v in ("compliant", "active"):
+            return "background:#0d3320;color:#3fb950"
+        if v in ("non-compliant", "inactive"):
+            return "background:#3d0c0c;color:#f85149"
+        if v in ("warning",):
+            return "background:#2d1f00;color:#e3b341"
+        if v == "na":
+            return "background:#1c1c1c;color:#6e7681"
+        return ""
+
+    from datetime import datetime
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+    headers = list(df.columns)
+    thead = "".join(f"<th>{h}</th>" for h in headers)
+    rows_html = ""
+    for _, row in df.iterrows():
+        cells = ""
+        for h in headers:
+            v = str(row[h]) if (row[h] is not None and row[h] != "") else ""
+            style = _cell_style(h, v)
+            style_attr = f' style="{style}"' if style else ""
+            cells += f"<td{style_attr}>{v or '—'}</td>"
+        rows_html += f"<tr>{cells}</tr>"
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>{title}</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+          background:#0d1117; color:#c9d1d9; margin:0; padding:1.5rem; font-size:0.82rem; }}
+  h1   {{ font-size:1.2rem; color:#e6edf3; margin-bottom:0.25rem; }}
+  .meta {{ color:#6e7681; margin-bottom:1rem; font-size:0.78rem; }}
+  table {{ border-collapse:collapse; width:100%; }}
+  th   {{ background:#161b22; color:#8b949e; font-weight:600; text-align:left;
+           padding:0.45rem 0.6rem; border-bottom:2px solid #30363d; white-space:nowrap; }}
+  td   {{ padding:0.38rem 0.6rem; border-bottom:1px solid #21262d; vertical-align:top; }}
+  tr:hover td {{ background:#161b22; }}
+  @media print {{
+    body {{ background:white; color:black; }}
+    tr:hover td {{ background:transparent; }}
+  }}
+</style>
+</head>
+<body>
+<h1>Cisco EOX Finder — {title}</h1>
+<p class="meta">Generated {now} · {len(df)} rows · {len(headers)} columns</p>
+<table>
+<thead><tr>{thead}</tr></thead>
+<tbody>{rows_html}</tbody>
+</table>
+</body>
+</html>"""
 
 
 @app.route("/swim/search", methods=["POST"])
@@ -2094,6 +2543,8 @@ def swim_upload():
 
     job_id = str(uuid.uuid4())[:8]
     _store_job(job_id, df)
+    _send_webhook_alert("swim", stats, job_id)
+    _record_job_meta(job_id, "swim", stats)
 
     return jsonify({
         "job_id":          job_id,
@@ -2206,6 +2657,8 @@ def psirt_upload():
 
     job_id = str(uuid.uuid4())[:8]
     _store_job(job_id, df)
+    _send_webhook_alert("psirt", stats, job_id)
+    _record_job_meta(job_id, "psirt", stats)
 
     return jsonify({
         "job_id":          job_id,
@@ -2405,6 +2858,8 @@ def unified_upload():
 
     job_id = str(uuid.uuid4())[:8]
     _store_job(job_id, df)
+    _send_webhook_alert("unified", stats, job_id)
+    _record_job_meta(job_id, "unified", stats)
 
     return jsonify({
         "job_id":          job_id,
@@ -2439,6 +2894,48 @@ def unified_download(job_id: str):
         download_name="cisco_unified_report.xlsx",
         as_attachment=True,
     )
+
+
+@app.route("/dashboard/data")
+def dashboard_data():
+    import json as _json
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT job_id, job_type, stats_json, created_at FROM job_meta "
+            "ORDER BY created_at DESC LIMIT 90"
+        ).fetchall()
+    jobs = [
+        {"job_id": r[0], "job_type": r[1],
+         "stats": _json.loads(r[2]), "created_at": r[3]}
+        for r in rows
+    ]
+    return jsonify(jobs)
+
+
+@app.route("/lists", methods=["GET"])
+def get_lists():
+    return jsonify(_list_saved_lists())
+
+
+@app.route("/lists/save", methods=["POST"])
+def save_list():
+    data = request.get_json(force=True)
+    name    = (data.get("name") or "").strip()
+    columns = data.get("columns") or []
+    rows    = data.get("rows") or []
+    if not name:
+        return jsonify({"error": "List name is required"}), 400
+    if not columns:
+        return jsonify({"error": "No columns provided"}), 400
+    list_id = _save_list(name, columns, rows)
+    return jsonify({"list_id": list_id, "name": name})
+
+
+@app.route("/lists/<list_id>", methods=["DELETE"])
+def delete_list(list_id: str):
+    if not _delete_saved_list(list_id):
+        return jsonify({"error": "Not found"}), 404
+    return jsonify({"ok": True})
 
 
 if __name__ == "__main__":

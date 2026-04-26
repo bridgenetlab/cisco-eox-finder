@@ -159,14 +159,71 @@ def get_psirt_summary(os_type: str, version: str) -> dict | None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Cisco PSIRT openVuln Security Advisory Tool")
-    parser.add_argument("--os-type", required=True, choices=list(OS_TYPES.keys()),
+    parser.add_argument("--os-type", choices=list(OS_TYPES.keys()),
                         metavar="OS_TYPE",
                         help=f"OS type ({', '.join(OS_TYPES)})")
-    parser.add_argument("--version", required=True, help="Software version string (e.g. 16.11.1)")
+    parser.add_argument("--version", help="Software version string (e.g. 16.11.1)")
+    parser.add_argument("--batch-file", metavar="FILE",
+                        help="Text file with one entry per line: 'os_type:version' (e.g. iosxe:16.11.1)")
     parser.add_argument("--severity", choices=["Critical", "High", "Medium", "Low"],
                         help="Filter displayed advisories to this SIR level only")
     parser.add_argument("--json", action="store_true", help="Output raw JSON")
     args = parser.parse_args()
+
+    if args.batch_file:
+        try:
+            lines = Path(args.batch_file).read_text().splitlines()
+        except OSError as e:
+            print(f"Cannot read batch file: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        entries: list[tuple[str, str]] = []
+        for raw in lines:
+            raw = raw.strip()
+            if not raw or raw.startswith("#"):
+                continue
+            if ":" in raw:
+                ot, ver = raw.split(":", 1)
+                ot = ot.strip().lower(); ver = ver.strip()
+            elif args.os_type:
+                ot = args.os_type; ver = raw
+            else:
+                print(f"Skipping '{raw}' — no os_type prefix and --os-type not set", file=sys.stderr)
+                continue
+            if ot not in OS_TYPES:
+                print(f"Skipping '{raw}' — unknown OS type '{ot}'", file=sys.stderr)
+                continue
+            entries.append((ot, ver))
+
+        results = [query_psirt_by_version(ot, ver) for ot, ver in entries]
+
+        if args.json:
+            print(json.dumps(results, indent=2))
+            return
+
+        for result in results:
+            advisories = result.get("advisories", [])
+            if args.severity:
+                advisories = [a for a in advisories if a["sir"].lower() == args.severity.lower()]
+            print(f"\n{'='*60}")
+            print(f"OS Type    : {OS_TYPES.get(result['os_type'], result['os_type'])}")
+            print(f"Version    : {result['version']}")
+            print(f"Compliance : {result['compliance']}")
+            print(f"Advisories : {len(result['advisories'])} total")
+            print(f"{'='*60}")
+            for adv in advisories:
+                print(f"\n  [{adv['sir']}] {adv['title']}")
+                print(f"  ID     : {adv['advisory_id']}")
+                print(f"  CVEs   : {', '.join(adv['cves']) or 'N/A'}")
+                print(f"  CVSS   : {adv['cvss_score'] or 'N/A'}")
+                if adv["publication_url"]:
+                    print(f"  URL    : {adv['publication_url']}")
+            if not advisories and not result.get("error"):
+                print("\n  No advisories found — device is Compliant.")
+        return
+
+    if not args.os_type or not args.version:
+        parser.error("--os-type and --version are required unless --batch-file is provided")
 
     result = query_psirt_by_version(args.os_type, args.version)
 

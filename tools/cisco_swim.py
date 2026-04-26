@@ -175,39 +175,21 @@ def get_suggested_release(pid: str) -> dict | None:
     return None
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Cisco SWIM Software Suggestion Tool")
-    parser.add_argument("--pid", required=True, help="Single Product ID (no wildcards or commas)")
-    parser.add_argument("--page", type=int, default=1, help="Page index (default: 1)")
-    parser.add_argument("--all-pages", action="store_true", help="Fetch all pages")
-    parser.add_argument("--json", action="store_true", help="Output raw JSON")
-    args = parser.parse_args()
-
-    if "*" in args.pid or "," in args.pid:
-        parser.error("SWIM API requires a single exact PID — wildcards and comma-separated lists are not supported")
-
-    result = query_all_pages_swim_by_pid(args.pid) if args.all_pages else query_swim_by_pid(args.pid, args.page)
-
-    if args.json:
-        print(json.dumps(result, indent=2))
-        return
-
+def _print_swim_result(result: dict) -> None:
+    """Print a single SWIM result in human-readable format."""
     if result.get("error"):
         print(f"ERROR: {result['error']}")
         return
-
     pg = result["pagination"]
     print(f"\n{'='*60}")
     print(f"Query : {result['query']}")
     print(f"Page  : {pg.get('page_index', 1)} of {pg.get('last_index', 1)} "
           f"({pg.get('total_records', 0)} total records)")
     print(f"{'='*60}")
-
     for product in result.get("products", []):
         print(f"\n  PID          : {product['base_pid']}")
         print(f"  Product      : {product['product_name']}")
         print(f"  Software Type: {product['software_type']}")
-
         for s in product.get("suggestions", []):
             if s.get("error"):
                 print(f"\n    [ERROR] {s['error']}")
@@ -220,6 +202,54 @@ def main() -> None:
             for img in s.get("images", []):
                 size_mb = round(int(img["size_bytes"]) / 1_048_576, 1) if img["size_bytes"] else "?"
                 print(f"      Image : {img['name']}  ({size_mb} MB)  [{img['feature_set']}]")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Cisco SWIM Software Suggestion Tool")
+    parser.add_argument("--pid", help="Single Product ID (no wildcards or commas)")
+    parser.add_argument("--batch-file", metavar="FILE",
+                        help="Text file with one PID per line")
+    parser.add_argument("--page", type=int, default=1, help="Page index (default: 1)")
+    parser.add_argument("--all-pages", action="store_true", help="Fetch all pages")
+    parser.add_argument("--json", action="store_true", help="Output raw JSON")
+    args = parser.parse_args()
+
+    if args.batch_file:
+        try:
+            lines = Path(args.batch_file).read_text().splitlines()
+        except OSError as e:
+            print(f"Cannot read batch file: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        pids = [l.strip() for l in lines if l.strip() and not l.strip().startswith("#")]
+        results = []
+        for pid in pids:
+            if "*" in pid or "," in pid:
+                print(f"Skipping '{pid}' — SWIM does not support wildcards or commas", file=sys.stderr)
+                continue
+            r = query_all_pages_swim_by_pid(pid) if args.all_pages else query_swim_by_pid(pid, args.page)
+            results.append(r)
+
+        if args.json:
+            print(json.dumps(results, indent=2))
+            return
+        for r in results:
+            _print_swim_result(r)
+        return
+
+    if not args.pid:
+        parser.error("--pid or --batch-file is required")
+
+    if "*" in args.pid or "," in args.pid:
+        parser.error("SWIM API requires a single exact PID — wildcards and comma-separated lists are not supported")
+
+    result = query_all_pages_swim_by_pid(args.pid) if args.all_pages else query_swim_by_pid(args.pid, args.page)
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return
+
+    _print_swim_result(result)
 
 
 if __name__ == "__main__":
