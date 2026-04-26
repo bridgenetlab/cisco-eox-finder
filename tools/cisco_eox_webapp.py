@@ -23,6 +23,7 @@ from flask import Flask, jsonify, render_template_string, request, send_file
 
 sys.path.insert(0, str(Path(__file__).parent))
 import cisco_eox
+import cisco_bug
 import cisco_psirt
 import cisco_sn2info
 import cisco_swim
@@ -123,7 +124,7 @@ def _send_webhook_alert(job_type: str, stats: dict, job_id: str) -> None:
         return
     non_compliant = (
         stats.get("non_compliant") or stats.get("noncompliant")
-        or stats.get("psirt_non_compliant") or 0
+        or stats.get("psirt_non_compliant") or stats.get("bug_non_compliant") or 0
     )
     if not non_compliant:
         return
@@ -194,6 +195,14 @@ COVERAGE_COLS = [
     ("Service Level",     "service_level"),
 ]
 
+# ── Bug API columns ───────────────────────────────────────────────────────────
+BUG_COLS = [
+    ("Bug Compliance",  "bug_compliance"),
+    ("Bug Open Count",  "open_count"),
+    ("Bug IDs",         "bug_ids"),
+    ("Bug Fixed Count", "critical_count"),
+]
+
 # ── Batched lookups ──────────────────────────────────────────────────────────
 def _build_pid_lookup(pids: list[str]) -> dict[str, dict]:
     """Query EOX API for a list of unique PIDs (batched 20 at a time)."""
@@ -253,6 +262,24 @@ def _build_psirt_lookup(
             lookup[key] = rec or {}
         except Exception as exc:
             print(f"PSIRT lookup failed for {os_type}/{version}: {exc}", file=sys.stderr)
+            lookup[key] = {}
+    return lookup
+
+
+def _build_bug_lookup(
+    pairs: list[tuple[str, str]],
+) -> dict[tuple[str, str], dict]:
+    """Query Bug API for unique (pid, version) pairs. version may be empty string."""
+    lookup: dict[tuple[str, str], dict] = {}
+    for pid, version in pairs:
+        key = (pid.upper(), version.lower())
+        if key in lookup:
+            continue
+        try:
+            rec = cisco_bug.get_bug_summary(pid, version)
+            lookup[key] = rec or {}
+        except Exception as exc:
+            print(f"Bug lookup failed for {pid}/{version}: {exc}", file=sys.stderr)
             lookup[key] = {}
     return lookup
 
@@ -496,6 +523,7 @@ select:focus { outline: none; border-color: #1f6feb; }
 thead th.cov-col   { color: #3fb950; }
 thead th.swim-col  { color: #e3b341; }
 thead th.psirt-col { color: #f85149; }
+thead th.bug-col   { color: #a371f7; }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 </head>
@@ -503,7 +531,7 @@ thead th.psirt-col { color: #f85149; }
 
 <header>
   <div class="logo">Cisco <span>EOX</span> Finder</div>
-  <p>End-of-Life · SWIM · PSIRT Security — Cisco APIs</p>
+  <p>End-of-Life · SWIM · PSIRT Security · Bugs — Cisco APIs</p>
 </header>
 
 <div class="tabs">
@@ -512,6 +540,7 @@ thead th.psirt-col { color: #f85149; }
   <button class="tab-btn" data-tab="swim">SWIM</button>
   <button class="tab-btn" data-tab="psirt">PSIRT</button>
   <button class="tab-btn" data-tab="unified">Unified Report</button>
+  <button class="tab-btn" data-tab="bugs">Bugs</button>
   <button class="tab-btn" data-tab="dashboard">Dashboard</button>
 </div>
 
@@ -790,8 +819,8 @@ thead th.psirt-col { color: #f85149; }
 <!-- ── Unified Report Tab ─────────────────────────────────────────────────── -->
 <div id="tab-unified" class="tab-panel">
   <div class="card">
-    <h2>Unified Report — EOX + Coverage + SWIM + PSIRT</h2>
-    <p style="font-size:0.85rem;color:#8b949e;margin:0 0 1rem">Upload one spreadsheet to enrich it with all four data sources at once.</p>
+    <h2>Unified Report — EOX + Coverage + SWIM + PSIRT + Bugs</h2>
+    <p style="font-size:0.85rem;color:#8b949e;margin:0 0 1rem">Upload one spreadsheet to enrich it with all five data sources at once.</p>
     <div class="drop-zone" id="unifiedDropZone">
       <div class="drop-icon">📋</div>
       <p>Drag &amp; drop your Excel file here, or click to browse</p>
@@ -847,11 +876,88 @@ thead th.psirt-col { color: #f85149; }
     <a id="unifiedDownloadLink" class="btn-green" href="#">⬇ Download Unified Report</a>
     <a id="unifiedDownloadHtmlLink" class="btn-secondary" href="#" target="_blank" style="margin-left:0.5rem">⎙ HTML Report</a>
     <button class="btn-secondary" onclick="saveCurrentList('unified')" style="margin-left:0.5rem">💾 Save List</button>
-    <span style="font-size:0.8rem;color:#6e7681;margin-left:0.75rem">Includes all original columns + EOX · Coverage · SWIM · PSIRT data</span>
+    <span style="font-size:0.8rem;color:#6e7681;margin-left:0.75rem">Includes all original columns + EOX · Coverage · SWIM · PSIRT · Bug data</span>
   </div>
   <div id="unifiedTableWrap" class="table-wrap" style="display:none">
     <table id="unifiedTable"><thead id="unifiedThead"></thead><tbody id="unifiedTbody"></tbody></table>
     <div class="pagination" id="unifiedPagination"></div>
+  </div>
+</div>
+
+<!-- ── Bugs Tab ── -->
+<div id="tab-bugs" class="tab-panel">
+
+  <!-- Single search -->
+  <div class="card">
+    <h2>Bugs — Known Defect Lookup</h2>
+    <form id="bugSearchForm">
+      <div class="form-row">
+        <div>
+          <label for="bugPid">Product ID (Base PID)</label>
+          <input type="text" id="bugPid" placeholder="e.g. WS-C3560-48PS-S" autocomplete="off">
+          <div class="hint">Single exact PID — no wildcards or commas</div>
+        </div>
+        <div>
+          <label for="bugVersion">Software Version (optional)</label>
+          <input type="text" id="bugVersion" placeholder="e.g. 12.2(25)SEE2" autocomplete="off">
+          <div class="hint">If provided, shows only bugs affecting this release</div>
+        </div>
+      </div>
+      <div class="btn-row">
+        <button type="submit" id="bugSearchBtn" class="btn-primary">Find Bugs</button>
+        <button type="button" id="bugClearBtn" class="btn-secondary">Clear</button>
+        <span id="bugSearchStatus" class="status-msg"></span>
+      </div>
+    </form>
+  </div>
+  <div id="bugResults"></div>
+
+  <!-- Bulk upload -->
+  <div class="card">
+    <h2>Bug Bulk Upload</h2>
+    <div class="drop-zone" id="bugDropZone">
+      <div class="drop-icon">🐛</div>
+      <p>Drag &amp; drop your Excel file here, or click to browse</p>
+      <p style="font-size:0.75rem;color:#6e7681">.xlsx / .csv · detects "Product Part" and optionally "Current Version"</p>
+      <input type="file" id="bugFileInput" accept=".xlsx,.xls,.csv" style="display:none">
+    </div>
+    <div id="bugDetectedCols" style="display:none;margin-bottom:1rem;">
+      <span style="font-size:0.8rem;color:#8b949e">Detected columns: </span>
+      <span id="bugColPid"     style="font-size:0.8rem;color:#3fb950;font-family:monospace"></span>
+      <span style="font-size:0.8rem;color:#6e7681"> · </span>
+      <span id="bugColVersion" style="font-size:0.8rem;color:#3fb950;font-family:monospace"></span>
+    </div>
+    <div class="progress-wrap" id="bugProgressWrap">
+      <div class="progress-bar-bg"><div class="progress-bar-fill" id="bugProgressFill" style="width:0%"></div></div>
+      <div class="progress-text" id="bugProgressText">Processing…</div>
+    </div>
+    <div id="bugColMappingWrap" style="display:none">
+      <p style="font-size:0.85rem;color:#8b949e;margin-bottom:0.75rem">Could not auto-detect columns. Select the correct ones below:</p>
+      <div class="form-row">
+        <div><label>Product ID Column</label><select id="bugManualPidSel"></select></div>
+        <div><label>Current Version Column (optional)</label><select id="bugManualVersionSel"></select></div>
+      </div>
+      <div class="btn-row" style="margin-top:0.75rem">
+        <button class="btn-primary" onclick="bugResubmitWithMapping()">Process with Selected Columns</button>
+      </div>
+    </div>
+    <div class="btn-row">
+      <button id="bugUploadBtn" class="btn-primary" disabled>Process File</button>
+      <button id="bugClearUploadBtn" class="btn-secondary">Clear</button>
+      <span id="bugUploadStatus" class="status-msg"></span>
+    </div>
+  </div>
+
+  <div id="bugSummaryBar"  class="summary-bar"                        style="display:none"></div>
+  <div id="bugDownloadBar" style="max-width:1200px;margin:0 auto 1rem;display:none">
+    <a id="bugDownloadLink" class="btn-green" href="#">⬇ Download Enriched Excel</a>
+    <a id="bugDownloadHtmlLink" class="btn-secondary" href="#" target="_blank" style="margin-left:0.5rem">⎙ HTML Report</a>
+    <button class="btn-secondary" onclick="saveCurrentList('bug')" style="margin-left:0.5rem">💾 Save List</button>
+    <span style="font-size:0.8rem;color:#6e7681;margin-left:0.75rem">Includes all original columns + Bug compliance data</span>
+  </div>
+  <div id="bugTableWrap" class="table-wrap" style="display:none">
+    <table id="bugTable"><thead id="bugThead"></thead><tbody id="bugTbody"></tbody></table>
+    <div class="pagination" id="bugPagination"></div>
   </div>
 </div>
 
@@ -874,6 +980,10 @@ thead th.psirt-col { color: #f85149; }
         <div style="flex:1;min-width:260px;max-width:340px">
           <h3 style="font-size:0.9rem;color:#8b949e;margin-bottom:0.75rem">Coverage Status (all Unified jobs)</h3>
           <canvas id="dashCovDonut" height="200"></canvas>
+        </div>
+        <div style="flex:1;min-width:260px;max-width:340px">
+          <h3 style="font-size:0.9rem;color:#8b949e;margin-bottom:0.75rem">Bug Compliance (all Bug / Unified jobs)</h3>
+          <canvas id="dashBugDonut" height="200"></canvas>
         </div>
       </div>
       <div style="margin-bottom:2rem">
@@ -1794,7 +1904,7 @@ function renderPsirtPagination() {
 // ── Unified Bulk Upload ───────────────────────────────────────────────────────
 let unifiedRows    = [];
 let unifiedHeaders = [];
-let unifiedColMeta = {};   // {eox:[...], cov:[...], swim:[...], psirt:[...]}
+let unifiedColMeta = {};   // {eox:[...], cov:[...], swim:[...], psirt:[...], bug:[...]}
 let unifiedPage    = 1;
 
 const unifiedDropZone     = document.getElementById('unifiedDropZone');
@@ -1939,7 +2049,10 @@ function renderUnifiedSummary(s) {
     <span class="pill pill-uk">${s.coverage_unknown} Unknown</span>
     <span class="pill pill-c">${s.psirt_compliant} PSIRT Compliant</span>
     <span class="pill pill-nc">${s.psirt_non_compliant} Non-Compliant</span>
-    <span class="pill pill-uk">${s.psirt_na} NA</span>`;
+    <span class="pill pill-uk">${s.psirt_na} NA</span>
+    <span class="pill pill-c">${s.bug_compliant||0} Bug Compliant</span>
+    <span class="pill pill-nc">${s.bug_non_compliant||0} Bug NC</span>
+    <span class="pill pill-uk">${s.bug_na||0} Bug NA</span>`;
 }
 
 function renderUnifiedTable() {
@@ -1948,12 +2061,14 @@ function renderUnifiedTable() {
   const covCols   = unifiedColMeta.cov   || [];
   const swimCols  = unifiedColMeta.swim  || [];
   const psirtCols = unifiedColMeta.psirt || [];
+  const bugCols   = unifiedColMeta.bug   || [];
   document.getElementById('unifiedThead').innerHTML =
     '<tr>' + unifiedHeaders.map(h => {
       const cls = eoxCols.includes(h)   ? 'eox-col'
                 : covCols.includes(h)   ? 'cov-col'
                 : swimCols.includes(h)  ? 'swim-col'
-                : psirtCols.includes(h) ? 'psirt-col' : '';
+                : psirtCols.includes(h) ? 'psirt-col'
+                : bugCols.includes(h)   ? 'bug-col' : '';
       return `<th class="${cls}">${h}</th>`;
     }).join('') + '</tr>';
   renderUnifiedPage(unifiedPage);
@@ -1967,6 +2082,7 @@ function renderUnifiedPage(page) {
   const covCols   = unifiedColMeta.cov   || [];
   const swimCols  = unifiedColMeta.swim  || [];
   const psirtCols = unifiedColMeta.psirt || [];
+  const bugCols   = unifiedColMeta.bug   || [];
   document.getElementById('unifiedTbody').innerHTML = slice.map(row =>
     '<tr>' + unifiedHeaders.map(h => {
       const v = row[h];
@@ -1975,10 +2091,11 @@ function renderUnifiedPage(page) {
       if (h === 'Coverage Status')    return `<td>${coverageStatusBadge(d)}</td>`;
       if (h === 'SWIM Compliance')    return `<td>${swimComplianceBadge(d)}</td>`;
       if (h === 'PSIRT Compliance')   return `<td>${psirtComplianceBadge(d)}</td>`;
+      if (h === 'Bug Compliance')     return `<td>${bugComplianceBadge(d)}</td>`;
       if (eoxCols.includes(h) || covCols.includes(h) || swimCols.includes(h)) {
         return `<td class="${!d?'na':'mono'}">${d||'N/A'}</td>`;
       }
-      if (psirtCols.includes(h)) {
+      if (psirtCols.includes(h) || bugCols.includes(h)) {
         return `<td class="${!d?'na':'mono'}" title="${d.replace(/"/g,'&quot;')}">${d||'N/A'}</td>`;
       }
       return `<td title="${d.replace(/"/g,'&quot;')}">${d}</td>`;
@@ -2048,6 +2165,7 @@ async function saveCurrentList(tabType) {
   else if (tabType === 'swim')   { rows = swimRows;    headers = swimHeaders; }
   else if (tabType === 'psirt')  { rows = psirtRows;   headers = psirtHeaders; }
   else if (tabType === 'unified'){ rows = unifiedRows; headers = unifiedHeaders; }
+  else if (tabType === 'bug')    { rows = bugRows;     headers = bugHeaders; }
   if (!rows || !rows.length) { alert('No data to save.'); return; }
   const name = prompt('Save list as:');
   if (!name) return;
@@ -2118,6 +2236,8 @@ function renderDashboard(jobs) {
   let psirtC = 0, psirtNC = 0, psirtNA = 0;
   // Aggregate Coverage
   let covA = 0, covI = 0, covU = 0;
+  // Aggregate Bug compliance
+  let bugC = 0, bugNC = 0, bugNA = 0;
 
   const trend = jobs.slice(0, 30).reverse().map(j => ({
     label: `${j.job_type.toUpperCase()} ${new Date(j.created_at*1000).toLocaleDateString()}`,
@@ -2142,6 +2262,11 @@ function renderDashboard(jobs) {
       covA += (s.coverage_active   || 0);
       covI += (s.coverage_inactive || 0);
       covU += (s.coverage_unknown  || 0);
+    }
+    if (j.job_type === 'bug' || j.job_type === 'unified') {
+      bugC  += (s.compliant        || s.bug_compliant     || 0);
+      bugNC += (s.non_compliant    || s.bug_non_compliant || 0);
+      bugNA += (s.na               || s.bug_na            || 0);
     }
   }
 
@@ -2179,7 +2304,13 @@ function renderDashboard(jobs) {
     ['#3fb950', '#f85149', '#6e7681']
   ));
 
-  const typeColor = t => t === 'eox' ? '#58a6ff' : t === 'psirt' ? '#f85149' : t === 'swim' ? '#e3b341' : '#3fb950';
+  rebuildChart('dashBugDonut', donutOpts(
+    ['Compliant', 'Non-Compliant', 'NA'],
+    [bugC, bugNC, bugNA],
+    ['#3fb950', '#f85149', '#6e7681']
+  ));
+
+  const typeColor = t => t === 'eox' ? '#58a6ff' : t === 'psirt' ? '#f85149' : t === 'swim' ? '#e3b341' : t === 'bug' ? '#a371f7' : '#3fb950';
   rebuildChart('dashTrendBar', {
     type: 'bar',
     data: {
@@ -2202,7 +2333,7 @@ function renderDashboard(jobs) {
   });
 
   // Job history table
-  const TYPE_COLOR = { eox: '#58a6ff', swim: '#e3b341', psirt: '#f85149', unified: '#3fb950' };
+  const TYPE_COLOR = { eox: '#58a6ff', swim: '#e3b341', psirt: '#f85149', unified: '#3fb950', bug: '#a371f7' };
   document.getElementById('dashJobTable').innerHTML = `
     <h3 style="font-size:0.9rem;color:#8b949e;margin-bottom:0.75rem">Recent Jobs</h3>
     <table style="width:100%;border-collapse:collapse;font-size:0.78rem">
@@ -2222,6 +2353,257 @@ function renderDashboard(jobs) {
       </tbody>
     </table>`;
 }
+
+// ── Bugs Tab ──────────────────────────────────────────────────────────────────
+let bugRows    = [];
+let bugHeaders = [];
+let bugCols    = [];
+let bugPage    = 1;
+
+// Single search
+document.getElementById('bugSearchForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const pid     = document.getElementById('bugPid').value.trim();
+  const version = document.getElementById('bugVersion').value.trim();
+  const status  = document.getElementById('bugSearchStatus');
+  const btn     = document.getElementById('bugSearchBtn');
+  if (!pid) { status.textContent = 'Enter a Product ID.'; return; }
+  btn.disabled = true;
+  status.textContent = '';
+  document.getElementById('bugResults').innerHTML = '<div class="loading"><span class="spinner"></span>Querying Cisco Bug API…</div>';
+  try {
+    const resp = await fetch('/bug/search', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({pid, version}),
+    });
+    const data = await resp.json();
+    if (!resp.ok) { document.getElementById('bugResults').innerHTML = `<div class="error-msg">Error: ${data.error || 'Unknown'}</div>`; return; }
+    renderBugResults(data.result);
+  } catch(err) {
+    document.getElementById('bugResults').innerHTML = `<div class="error-msg">Network error: ${err.message}</div>`;
+  } finally { btn.disabled = false; }
+});
+
+document.getElementById('bugClearBtn').addEventListener('click', () => {
+  document.getElementById('bugPid').value = '';
+  document.getElementById('bugVersion').value = '';
+  document.getElementById('bugResults').innerHTML = '';
+  document.getElementById('bugSearchStatus').textContent = '';
+});
+
+function bugSeverityBadge(sev) {
+  const n = parseInt(sev, 10);
+  if (n === 1) return `<span class="badge-sm badge-sm-nc">Critical</span>`;
+  if (n === 2) return `<span class="badge-sm" style="background:rgba(227,100,0,.15);color:#e37300;border:1px solid rgba(227,100,0,.3)">High</span>`;
+  if (n === 3) return `<span class="badge-sm badge-sm-uk">Moderate</span>`;
+  if (n === 4) return `<span class="badge-sm badge-sm-uk">Minor</span>`;
+  return `<span class="badge-sm badge-sm-uk">${sev||'?'}</span>`;
+}
+
+function bugStatusBadge(status) {
+  const labels = {O:'Open',F:'Fixed',T:'Terminated',E:'Unreproducible',D:'Duplicate'};
+  const label = labels[status] || status || '?';
+  if (status === 'O') return `<span class="badge-sm badge-sm-nc">${label}</span>`;
+  if (status === 'F') return `<span class="badge-sm badge-sm-c">${label}</span>`;
+  return `<span class="badge-sm badge-sm-uk">${label}</span>`;
+}
+
+function bugComplianceBadge(label) {
+  if (!label) return '<span class="badge-sm badge-sm-uk">Unknown</span>';
+  const l = label.toLowerCase();
+  if (l === 'compliant')     return `<span class="badge-sm badge-sm-c">${label}</span>`;
+  if (l === 'non-compliant') return `<span class="badge-sm badge-sm-nc">${label}</span>`;
+  if (l === 'na')            return `<span class="badge-sm badge-sm-uk">NA</span>`;
+  return `<span class="badge-sm badge-sm-uk">${label}</span>`;
+}
+
+function renderBugResults(result) {
+  const div = document.getElementById('bugResults');
+  if (result.error) { div.innerHTML = `<div class="error-msg">Error: ${result.error}</div>`; return; }
+  const bugs = result.bugs || [];
+  const openBugs = bugs.filter(b => b.status === 'O');
+  let html = `<div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
+      <div>
+        <span style="font-family:monospace;color:#a371f7;font-size:1rem;font-weight:700">${result.pid}</span>
+        ${result.version ? `<span style="color:#6e7681;font-size:0.85rem;margin-left:0.5rem">v${result.version}</span>` : ''}
+      </div>
+      <div style="display:flex;gap:0.75rem;align-items:center">
+        ${bugComplianceBadge(result.compliance)}
+        <span style="font-size:0.8rem;color:#6e7681">${bugs.length} bugs · ${openBugs.length} open</span>
+      </div>
+    </div>`;
+  if (bugs.length) {
+    html += `<div class="table-wrap" style="margin:0"><table style="width:100%;border-collapse:collapse;font-size:0.78rem">
+      <thead><tr>
+        <th style="padding:0.4rem 0.6rem;text-align:left;color:#8b949e;border-bottom:1px solid #30363d;white-space:nowrap">Severity</th>
+        <th style="padding:0.4rem 0.6rem;text-align:left;color:#8b949e;border-bottom:1px solid #30363d">Bug ID</th>
+        <th style="padding:0.4rem 0.6rem;text-align:left;color:#8b949e;border-bottom:1px solid #30363d">Headline</th>
+        <th style="padding:0.4rem 0.6rem;text-align:left;color:#8b949e;border-bottom:1px solid #30363d;white-space:nowrap">Status</th>
+        <th style="padding:0.4rem 0.6rem;text-align:left;color:#8b949e;border-bottom:1px solid #30363d">Affected</th>
+        <th style="padding:0.4rem 0.6rem;text-align:left;color:#8b949e;border-bottom:1px solid #30363d">Fixed In</th>
+      </tr></thead><tbody>`;
+    for (const b of bugs) {
+      const bugUrl = `https://bst.cloudapps.cisco.com/bugsearch/bug/${b.bug_id}`;
+      html += `<tr style="border-bottom:1px solid #21262d">
+        <td style="padding:0.4rem 0.6rem">${bugSeverityBadge(b.severity)}</td>
+        <td style="padding:0.4rem 0.6rem;font-family:monospace"><a href="${bugUrl}" target="_blank" style="color:#a371f7;text-decoration:none">${b.bug_id}</a></td>
+        <td style="padding:0.4rem 0.6rem;max-width:400px;overflow:hidden;text-overflow:ellipsis" title="${(b.headline||'').replace(/"/g,'&quot;')}">${b.headline||''}</td>
+        <td style="padding:0.4rem 0.6rem">${bugStatusBadge(b.status)}</td>
+        <td style="padding:0.4rem 0.6rem;font-family:monospace;font-size:0.72rem;max-width:180px;overflow:hidden;text-overflow:ellipsis" title="${(b.known_affected_releases||'').replace(/"/g,'&quot;')}">${b.known_affected_releases||'—'}</td>
+        <td style="padding:0.4rem 0.6rem;font-family:monospace;font-size:0.72rem;max-width:180px;overflow:hidden;text-overflow:ellipsis" title="${(b.known_fixed_releases||'').replace(/"/g,'&quot;')}">${b.known_fixed_releases||'—'}</td>
+      </tr>`;
+    }
+    html += '</tbody></table></div>';
+  } else {
+    html += '<p style="color:#3fb950;padding:1rem 0">No bugs found — device is Compliant.</p>';
+  }
+  html += '</div>';
+  div.innerHTML = html;
+}
+
+// Bulk upload
+let _bugFile = null;
+let _bugAvailCols = [];
+
+const bugDropZone  = document.getElementById('bugDropZone');
+const bugFileInput = document.getElementById('bugFileInput');
+const bugUploadBtn = document.getElementById('bugUploadBtn');
+
+bugDropZone.addEventListener('click', () => bugFileInput.click());
+bugDropZone.addEventListener('dragover', e => { e.preventDefault(); bugDropZone.classList.add('dragover'); });
+bugDropZone.addEventListener('dragleave', () => bugDropZone.classList.remove('dragover'));
+bugDropZone.addEventListener('drop', e => { e.preventDefault(); bugDropZone.classList.remove('dragover'); if (e.dataTransfer.files[0]) { bugFileInput.files = e.dataTransfer.files; onBugFile(e.dataTransfer.files[0]); } });
+bugFileInput.addEventListener('change', () => { if (bugFileInput.files[0]) onBugFile(bugFileInput.files[0]); });
+
+function onBugFile(file) {
+  _bugFile = file;
+  bugUploadBtn.disabled = false;
+  document.getElementById('bugUploadStatus').textContent = file.name;
+}
+
+document.getElementById('bugClearUploadBtn').addEventListener('click', () => {
+  _bugFile = null; bugUploadBtn.disabled = true;
+  bugFileInput.value = '';
+  document.getElementById('bugUploadStatus').textContent = '';
+  document.getElementById('bugDetectedCols').style.display = 'none';
+  document.getElementById('bugColMappingWrap').style.display = 'none';
+  document.getElementById('bugProgressWrap').style.display = 'none';
+  document.getElementById('bugSummaryBar').style.display = 'none';
+  document.getElementById('bugDownloadBar').style.display = 'none';
+  document.getElementById('bugTableWrap').style.display = 'none';
+  bugRows = []; bugHeaders = []; bugCols = [];
+});
+
+bugUploadBtn.addEventListener('click', () => doBugUpload({}));
+
+async function doBugUpload(extraFields) {
+  if (!_bugFile) return;
+  const pw = document.getElementById('bugProgressWrap');
+  const pf = document.getElementById('bugProgressFill');
+  const pt = document.getElementById('bugProgressText');
+  pw.style.display = 'block'; pf.style.width = '30%'; pt.textContent = 'Uploading…';
+  bugUploadBtn.disabled = true;
+  const fd = new FormData();
+  fd.append('file', _bugFile);
+  for (const [k, v] of Object.entries(extraFields)) fd.append(k, v);
+  try {
+    pf.style.width = '60%'; pt.textContent = 'Querying Bug API…';
+    const resp = await fetch('/bug/upload', { method: 'POST', body: fd });
+    const data = await resp.json();
+    pf.style.width = '100%';
+    if (!resp.ok) { pt.textContent = 'Error: ' + (data.error || 'Unknown'); bugUploadBtn.disabled = false; return; }
+    if (data.needs_mapping) {
+      pt.textContent = 'Column mapping required.';
+      _bugAvailCols = data.available_columns || [];
+      const pidSel = document.getElementById('bugManualPidSel');
+      const verSel = document.getElementById('bugManualVersionSel');
+      pidSel.innerHTML = _bugAvailCols.map(c => `<option value="${c}">${c}</option>`).join('');
+      verSel.innerHTML = '<option value="">(none)</option>' + _bugAvailCols.map(c => `<option value="${c}">${c}</option>`).join('');
+      document.getElementById('bugColMappingWrap').style.display = 'block';
+      bugUploadBtn.disabled = false;
+      return;
+    }
+    pw.style.display = 'none';
+    document.getElementById('bugColMappingWrap').style.display = 'none';
+    if (data.pid_col) {
+      document.getElementById('bugDetectedCols').style.display = 'block';
+      document.getElementById('bugColPid').textContent = data.pid_col || '';
+      document.getElementById('bugColVersion').textContent = data.version_col || '';
+    }
+    bugRows = data.rows || [];
+    bugHeaders = data.headers || [];
+    bugCols = data.bug_col_names || [];
+    bugPage = 1;
+    renderBugSummary(data.stats);
+    renderBugTable();
+    document.getElementById('bugDownloadLink').href     = `/bug/download/${data.job_id}`;
+    document.getElementById('bugDownloadHtmlLink').href = `/bug/html/${data.job_id}`;
+    document.getElementById('bugDownloadBar').style.display = 'block';
+  } catch(err) {
+    pt.textContent = 'Network error: ' + err.message;
+  } finally { bugUploadBtn.disabled = false; }
+}
+
+function bugResubmitWithMapping() {
+  const pid_col     = document.getElementById('bugManualPidSel').value;
+  const version_col = document.getElementById('bugManualVersionSel').value;
+  doBugUpload({pid_col, version_col});
+}
+
+function renderBugSummary(s) {
+  const bar = document.getElementById('bugSummaryBar');
+  bar.style.display = 'flex';
+  bar.innerHTML = `
+    <span class="pill pill-total">${s.total} Total Rows</span>
+    <span class="pill pill-total">${s.unique_pids} Unique PIDs</span>
+    <span class="pill pill-c">${s.compliant} Compliant</span>
+    <span class="pill pill-nc">${s.non_compliant} Non-Compliant</span>
+    <span class="pill pill-uk">${s.na} NA</span>`;
+}
+
+function renderBugTable() {
+  document.getElementById('bugTableWrap').style.display = 'block';
+  document.getElementById('bugThead').innerHTML =
+    '<tr>' + bugHeaders.map(h => {
+      const cls = bugCols.includes(h) ? 'bug-col' : '';
+      return `<th class="${cls}">${h}</th>`;
+    }).join('') + '</tr>';
+  renderBugPage(bugPage);
+}
+
+function renderBugPage(page) {
+  bugPage = page;
+  const start = (page - 1) * PAGE_SIZE;
+  const slice = bugRows.slice(start, start + PAGE_SIZE);
+  document.getElementById('bugTbody').innerHTML = slice.map(row =>
+    '<tr>' + bugHeaders.map(h => {
+      const v = row[h];
+      const d = (v === null || v === undefined || v === '') ? '' : String(v);
+      if (h === 'Bug Compliance') return `<td>${bugComplianceBadge(d)}</td>`;
+      if (bugCols.includes(h)) return `<td class="${!d?'na':'mono'}" title="${d.replace(/"/g,'&quot;')}">${d||'N/A'}</td>`;
+      return `<td title="${d.replace(/"/g,'&quot;')}">${d}</td>`;
+    }).join('') + '</tr>'
+  ).join('');
+  renderBugPagination();
+}
+
+function renderBugPagination() {
+  const total = bugRows.length;
+  const pages = Math.ceil(total / PAGE_SIZE);
+  const pg = document.getElementById('bugPagination');
+  if (pages <= 1) { pg.innerHTML = ''; return; }
+  let html = `<span class="page-info-txt">Rows ${(bugPage-1)*PAGE_SIZE+1}–${Math.min(bugPage*PAGE_SIZE,total)} of ${total}</span>`;
+  if (bugPage > 1) html += `<button class="page-btn" onclick="renderBugPage(${bugPage-1})">‹ Prev</button>`;
+  const bs = Math.max(1, bugPage-3), be = Math.min(pages, bugPage+3);
+  for (let i = bs; i <= be; i++)
+    html += `<button class="page-btn${i===bugPage?' active':''}" onclick="renderBugPage(${i})">${i}</button>`;
+  if (bugPage < pages) html += `<button class="page-btn" onclick="renderBugPage(${bugPage+1})">Next ›</button>`;
+  pg.innerHTML = html;
+}
+
+// Trigger dashboard reload when Bugs tab is clicked
+document.querySelector('.tab-btn[data-tab="bugs"]').addEventListener('click', () => { /* standalone tab, no auto-load */ });
 </script>
 </body>
 </html>
@@ -2408,7 +2790,7 @@ def unified_html(job_id: str):
 def _generate_html_report(df: pd.DataFrame, title: str) -> str:
     """Generate a self-contained, printable HTML compliance report from a job DataFrame."""
     COMPLIANCE_COLS = {
-        "EOX Compliance", "SWIM Compliance", "PSIRT Compliance", "Coverage Status"
+        "EOX Compliance", "SWIM Compliance", "PSIRT Compliance", "Coverage Status", "Bug Compliance"
     }
 
     def _cell_style(col: str, val: str) -> str:
@@ -2688,6 +3070,128 @@ def psirt_download(job_id: str):
     )
 
 
+@app.route("/bug/search", methods=["POST"])
+def bug_search():
+    data = request.get_json(force=True)
+    pid     = (data.get("pid") or "").strip()
+    version = (data.get("version") or "").strip()
+    if not pid:
+        return jsonify({"error": "Provide a Product ID"}), 400
+    if "*" in pid or "," in pid:
+        return jsonify({"error": "Bug API requires a single exact PID — no wildcards or commas"}), 400
+    try:
+        bugs = cisco_bug.get_bugs_by_pid_version(pid, version) if version else cisco_bug.get_bugs_by_pid(pid)
+    except Exception as e:
+        return jsonify({"error": f"API error: {e}"}), 502
+    return jsonify({"result": {
+        "pid":        pid,
+        "version":    version,
+        "bugs":       bugs,
+        "compliance": cisco_bug._bug_compliance(bugs),
+        "error":      None,
+    }})
+
+
+@app.route("/bug/upload", methods=["POST"])
+def bug_upload():
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "Empty filename"}), 400
+
+    fname = f.filename.lower()
+    try:
+        df = pd.read_csv(f, dtype=str) if fname.endswith(".csv") else pd.read_excel(f, dtype=str)
+    except Exception as e:
+        return jsonify({"error": f"Could not read file: {e}"}), 400
+    df = df.fillna("")
+
+    pid_col     = request.form.get("pid_col", "").strip()     or _find_col(df, PID_KEYWORDS)
+    version_col = request.form.get("version_col", "").strip() or _find_col(df, SWIM_VERSION_KEYWORDS)
+
+    if not pid_col:
+        return jsonify({"needs_mapping": True, "available_columns": list(df.columns), "context": "bug"})
+
+    pairs: list[tuple[str, str]] = []
+    for _, row in df.iterrows():
+        pid_val = str(row[pid_col]).strip()
+        if not pid_val:
+            continue
+        ver = str(row[version_col]).strip() if version_col else ""
+        pairs.append((pid_val.upper(), ver))
+
+    unique_pairs = list(dict.fromkeys(pairs))
+    try:
+        bug_lookup = _build_bug_lookup(unique_pairs)
+    except Exception as e:
+        return jsonify({"error": f"Bug API error: {e}"}), 502
+
+    bug_col_names = [c[0] for c in BUG_COLS]
+    for col_name in bug_col_names:
+        df[col_name] = ""
+
+    for idx, row in df.iterrows():
+        pid_val = str(row[pid_col]).strip()
+        if not pid_val:
+            df.at[idx, "Bug Compliance"] = "NA"
+            continue
+        ver = str(row[version_col]).strip() if version_col else ""
+        rec = bug_lookup.get((pid_val.upper(), ver.lower())) or {}
+        df.at[idx, "Bug Compliance"]  = rec.get("bug_compliance", "")
+        df.at[idx, "Bug Open Count"]  = str(rec.get("open_count", "")) if rec else ""
+        df.at[idx, "Bug IDs"]         = rec.get("bug_ids", "")
+        df.at[idx, "Bug Fixed Count"] = str(rec.get("critical_count", "")) if rec else ""
+
+    comp_col = df["Bug Compliance"]
+    stats = {
+        "total":        len(df),
+        "unique_pids":  len(unique_pairs),
+        "compliant":    int((comp_col == "Compliant").sum()),
+        "non_compliant": int((comp_col == "Non-Compliant").sum()),
+        "na":           int(((comp_col == "NA") | (comp_col == "")).sum()),
+    }
+
+    job_id = str(uuid.uuid4())[:8]
+    _store_job(job_id, df)
+    _record_job_meta(job_id, "bug", stats)
+    _send_webhook_alert("bug", stats, job_id)
+
+    return jsonify({
+        "job_id":        job_id,
+        "pid_col":       pid_col,
+        "version_col":   version_col,
+        "headers":       list(df.columns),
+        "bug_col_names": bug_col_names,
+        "rows":          df.to_dict(orient="records"),
+        "stats":         stats,
+    })
+
+
+@app.route("/bug/download/<job_id>")
+def bug_download(job_id: str):
+    df = _load_job(job_id)
+    if df is None:
+        return "Job not found or expired", 404
+    buf = io.BytesIO()
+    df.to_excel(buf, index=False, engine="openpyxl")
+    buf.seek(0)
+    return send_file(
+        buf,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        download_name="cisco_bug_enriched.xlsx",
+        as_attachment=True,
+    )
+
+
+@app.route("/bug/html/<job_id>")
+def bug_html(job_id: str):
+    df = _load_job(job_id)
+    if df is None:
+        return "Job not found or expired", 404
+    return _generate_html_report(df, "Bug Compliance Report"), 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
 @app.route("/unified/upload", methods=["POST"])
 def unified_upload():
     if "file" not in request.files:
@@ -2775,13 +3279,34 @@ def unified_upload():
     except Exception as e:
         return jsonify({"error": f"PSIRT API error: {e}"}), 502
 
+    # ── Bug lookup ────────────────────────────────────────────────────────────
+    bug_pairs: list[tuple[str, str]] = []
+    for _, row in df.iterrows():
+        eff_pid = ""
+        if pid_col:
+            eff_pid = str(row[pid_col]).strip().upper()
+        elif sn_col:
+            sn = str(row[sn_col]).strip().upper()
+            cov = coverage_lookup.get(sn) or {}
+            eff_pid = (cov.get("orderable_pid") or cov.get("base_pid") or "").upper()
+        if eff_pid:
+            ver = str(row[version_col]).strip() if version_col else ""
+            bug_pairs.append((eff_pid, ver))
+
+    unique_bug_pairs = list(dict.fromkeys(bug_pairs))
+    try:
+        bug_lookup = _build_bug_lookup(unique_bug_pairs) if unique_bug_pairs else {}
+    except Exception as e:
+        return jsonify({"error": f"Bug API error: {e}"}), 502
+
     # ── Add enriched columns ─────────────────────────────────────────────────
     eox_col_names   = [c[0] for c in EOX_COLS]
     cov_col_names   = [c[0] for c in COVERAGE_COLS]
     swim_col_names  = [c[0] for c in SWIM_COLS]
     psirt_col_names = [c[0] for c in PSIRT_COLS]
+    bug_col_names   = [c[0] for c in BUG_COLS]
 
-    for name in eox_col_names + cov_col_names + swim_col_names + psirt_col_names:
+    for name in eox_col_names + cov_col_names + swim_col_names + psirt_col_names + bug_col_names:
         df[name] = ""
 
     for idx, row in df.iterrows():
@@ -2843,17 +3368,33 @@ def unified_upload():
         else:
             df.at[idx, "PSIRT Compliance"] = "NA"
 
+        # Bug
+        bug_pid = swim_pid  # reuse already-resolved effective PID
+        if not bug_pid:
+            df.at[idx, "Bug Compliance"] = "NA"
+        else:
+            ver = str(row[version_col]).strip() if version_col else ""
+            brec = bug_lookup.get((bug_pid.upper(), ver.lower())) or {}
+            df.at[idx, "Bug Compliance"]  = brec.get("bug_compliance", "")
+            df.at[idx, "Bug Open Count"]  = str(brec.get("open_count", "")) if brec else ""
+            df.at[idx, "Bug IDs"]         = brec.get("bug_ids", "")
+            df.at[idx, "Bug Fixed Count"] = str(brec.get("critical_count", "")) if brec else ""
+
     # ── Stats ─────────────────────────────────────────────────────────────────
-    cov_col  = df["Coverage Status"]
+    cov_col   = df["Coverage Status"]
     psirt_col = df["PSIRT Compliance"]
+    bug_col   = df["Bug Compliance"]
     stats = {
-        "total":              len(df),
-        "coverage_active":   int((cov_col == "Active").sum()),
-        "coverage_inactive": int((cov_col == "Inactive").sum()),
-        "coverage_unknown":  int(((cov_col == "") | (cov_col.isna())).sum()),
-        "psirt_compliant":    int((psirt_col == "Compliant").sum()),
+        "total":               len(df),
+        "coverage_active":    int((cov_col == "Active").sum()),
+        "coverage_inactive":  int((cov_col == "Inactive").sum()),
+        "coverage_unknown":   int(((cov_col == "") | (cov_col.isna())).sum()),
+        "psirt_compliant":     int((psirt_col == "Compliant").sum()),
         "psirt_non_compliant": int((psirt_col == "Non-Compliant").sum()),
-        "psirt_na":           int(((psirt_col == "NA") | (psirt_col == "")).sum()),
+        "psirt_na":            int(((psirt_col == "NA") | (psirt_col == "")).sum()),
+        "bug_compliant":       int((bug_col == "Compliant").sum()),
+        "bug_non_compliant":   int((bug_col == "Non-Compliant").sum()),
+        "bug_na":              int(((bug_col == "NA") | (bug_col == "")).sum()),
     }
 
     job_id = str(uuid.uuid4())[:8]
@@ -2874,6 +3415,7 @@ def unified_upload():
             "cov":   cov_col_names,
             "swim":  swim_col_names,
             "psirt": psirt_col_names,
+            "bug":   bug_col_names,
         },
         "rows":  df.to_dict(orient="records"),
         "stats": stats,

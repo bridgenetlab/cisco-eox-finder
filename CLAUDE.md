@@ -107,13 +107,15 @@ cisco-eox-finder/
 │   ├── cisco_swim.py         # SWIM API client + CLI entry point
 │   ├── cisco_psirt.py        # PSIRT openVuln API client + CLI entry point
 │   ├── cisco_sn2info.py      # SN2INFO contract coverage + PID resolution client + CLI
-│   ├── cisco_eox_webapp.py   # Flask web app (imports all four clients above)
+│   ├── cisco_bug.py          # Bug API v2.0 client + CLI entry point
+│   ├── cisco_eox_webapp.py   # Flask web app (imports all five clients above)
 │   └── requirements.txt      # Python dependencies
 ├── workflows/
 │   ├── cisco_eox_lookup.md      # SOP for EOX data retrieval
 │   ├── cisco_swim_lookup.md     # SOP for SWIM software suggestion lookup
 │   ├── cisco_psirt_lookup.md    # SOP for PSIRT security advisory lookup
-│   └── cisco_sn2info_lookup.md  # SOP for SN2INFO contract coverage + PID resolution
+│   ├── cisco_sn2info_lookup.md  # SOP for SN2INFO contract coverage + PID resolution
+│   └── cisco_bug_lookup.md      # SOP for Bug API v2.0 lookup
 ├── .github/
 │   └── workflows/
 │       └── docker-publish.yml  # CI/CD: builds and pushes Docker image to GHCR
@@ -319,6 +321,69 @@ python cisco_psirt.py --os-type iosxe --version 16.11.1 --severity Critical
 
 ---
 
+### `tools/cisco_bug.py` — Bug API v2.0 Client
+
+Queries the Cisco Bug API v2.0 for known defects (CSCxxx IDs) by Product ID and optional software version.
+
+**Environment variables required:** same as EOX (`CISCO_CLIENT_ID`, `CISCO_CLIENT_SECRET`).
+`get_access_token()` is imported from `cisco_eox` — the token cache is shared.
+
+Optional: `BUG_SEVERITY_THRESHOLD` (default `2`; numeric 1=Critical, 2=High, 3=Moderate, 4=Minor).
+
+**Key functions:**
+
+| Function | Purpose |
+|---|---|
+| `get_bugs_by_pid(pid)` | Returns all normalized bugs for a PID (all pages) |
+| `get_bugs_by_pid_version(pid, version)` | Bugs affecting a specific PID + version; falls back to `get_bugs_by_pid` on 404 |
+| `get_bug_summary(pid, version="")` | Convenience: returns `{bug_compliance, open_count, critical_count, bug_ids}` or `None` |
+| `_bug_compliance(bugs)` | Returns `"Compliant"` / `"Non-Compliant"` based on open bugs at threshold severity |
+| `_parse_bug(bug)` | Flatten API bug dict → normalized dict |
+
+**Compliance rules:**
+
+| Status | Condition |
+|---|---|
+| `Non-Compliant` | Open bug with `severity <= BUG_SEVERITY_THRESHOLD` found |
+| `Compliant` | No open bugs meet the threshold (including empty list or all Fixed) |
+| `NA` | No PID provided — callers set this when PID is absent |
+
+**Normalized bug output:**
+```python
+{
+    "bug_id":                  str,   # e.g. "CSCtr13789"
+    "headline":                str,
+    "severity":                int,   # 1=Critical, 2=High, 3=Moderate, 4=Minor
+    "severity_label":          str,
+    "status":                  str,   # O=Open, F=Fixed, T=Terminated, E=Unreproducible, D=Duplicate
+    "status_label":            str,
+    "product":                 str,
+    "base_pid":                str,
+    "known_affected_releases": str,
+    "known_fixed_releases":    str,
+    "created_date":            str,   # YYYY-MM-DD
+    "last_modified_date":      str,
+    "support_case_count":      str,
+}
+```
+
+**CLI usage:**
+```bash
+cd tools
+python cisco_bug.py --pid WS-C3560-48PS-S
+python cisco_bug.py --pid WS-C3560-48PS-S --version "12.2(25)SEE2"
+python cisco_bug.py --pid WS-C3560-48PS-S --json
+python cisco_bug.py --batch-file devices.txt   # one pid or pid:version per line
+```
+
+**API constraints:**
+- One PID per request — no batch endpoint
+- Pagination: 10 bugs per page; client walks all pages automatically
+- Stop condition: `len(page_bugs) < 10` (last page)
+- 400/404 treated as no bugs (empty result → `Compliant`)
+
+---
+
 ### `tools/cisco_sn2info.py` — SN2INFO API Client
 
 Queries the Cisco SN2INFO v2 API to resolve serial numbers to Product IDs and retrieve contract coverage status.
@@ -362,7 +427,7 @@ python cisco_sn2info.py --sn "SN1,SN2,SN3" --json
 
 ### `tools/cisco_eox_webapp.py` — Flask Web Application
 
-Imports `cisco_eox`, `cisco_swim`, `cisco_psirt`, and `cisco_sn2info`. Serves a single-page application with five tabs.
+Imports `cisco_eox`, `cisco_swim`, `cisco_psirt`, `cisco_sn2info`, and `cisco_bug`. Serves a single-page application with seven tabs.
 
 **Routes:**
 
@@ -379,7 +444,11 @@ Imports `cisco_eox`, `cisco_swim`, `cisco_psirt`, and `cisco_sn2info`. Serves a 
 | `/psirt/search` | POST | Single version PSIRT lookup; returns `{result: {...}}` |
 | `/psirt/upload` | POST | Accept `.xlsx`/`.csv`, enrich with PSIRT advisory + compliance data |
 | `/psirt/download/<job_id>` | GET | Stream PSIRT-enriched Excel for download |
-| `/unified/upload` | POST | Accept `.xlsx`/`.csv`, enrich with EOX + Coverage + SWIM + PSIRT data |
+| `/bug/search` | POST | Single PID bug lookup; returns `{result: {...}}` |
+| `/bug/upload` | POST | Accept `.xlsx`/`.csv`, enrich with Bug compliance data |
+| `/bug/download/<job_id>` | GET | Stream Bug-enriched Excel for download |
+| `/bug/html/<job_id>` | GET | HTML report for a Bug job |
+| `/unified/upload` | POST | Accept `.xlsx`/`.csv`, enrich with EOX + Coverage + SWIM + PSIRT + Bug data |
 | `/unified/download/<job_id>` | GET | Stream unified report Excel for download |
 
 **EOX bulk upload behavior:**
@@ -410,16 +479,27 @@ Imports `cisco_eox`, `cisco_swim`, `cisco_psirt`, and `cisco_sn2info`. Serves a 
 7. Rows with no version value get `PSIRT Compliance = NA`
 8. Stores enriched DataFrame in the shared SQLite job store
 
+**Bug bulk upload behavior:**
+1. Reads file (`.xlsx`/`.xls`/`.csv`) into a Pandas DataFrame (all columns as strings)
+2. Auto-detects PID column (same keywords as EOX)
+3. Auto-detects optional version column (same keywords as SWIM)
+4. If no PID column found: returns `needs_mapping` (context: `"bug"`) for manual mapping
+5. **One API call per unique (pid, version) pair** — no batch endpoint
+6. Appends 4 new columns: Bug Compliance, Bug Open Count, Bug IDs, Bug Fixed Count
+7. Rows with no PID get `Bug Compliance = NA`
+8. Stores enriched DataFrame in the shared SQLite job store
+
 **Unified Report bulk upload behavior:**
 1. Reads file (`.xlsx`/`.xls`/`.csv`) into a Pandas DataFrame (all columns as strings)
 2. Auto-detects PID column, SN column, version column, and OS Type column
 3. **Requires at least a PID or SN column** — returns `needs_mapping` (context: `"unified"`) if neither found
-4. Runs all four lookups in sequence: EOX → Coverage (SN2INFO) → SWIM → PSIRT
-5. For SWIM when no PID column: uses `orderable_pid` resolved from SN2INFO coverage lookup
-6. Appends 18 new columns total: 7 EOX + 4 Coverage + 3 SWIM + 4 PSIRT
+4. Runs all five lookups in sequence: EOX → Coverage (SN2INFO) → SWIM → PSIRT → Bug
+5. For SWIM/Bug when no PID column: uses `orderable_pid` resolved from SN2INFO coverage lookup
+6. Appends 22 new columns total: 7 EOX + 4 Coverage + 3 SWIM + 4 PSIRT + 4 Bug
 7. Coverage columns populated only when SN column is present
 8. Rows without a version value get `PSIRT Compliance = NA`
-9. Stores enriched DataFrame in the shared SQLite job store
+9. Rows without a resolvable PID get `Bug Compliance = NA`
+10. Stores enriched DataFrame in the shared SQLite job store
 
 **Starting the web app:**
 ```bash
@@ -452,6 +532,16 @@ The SOP for serial number → PID resolution and contract coverage lookups. Key 
 - Web App usage via the Unified Report tab
 - Expected output fields (coverage_status, orderable_pid, etc.)
 - API constraints (batch size 20, pagination, rate limits)
+
+### `workflows/cisco_bug_lookup.md`
+
+The SOP for Bug API v2.0 lookups. Key sections:
+- Compliance rules (Open bugs only; numeric severity threshold)
+- CLI usage (single PID, PID+version, batch file)
+- Web App: Bugs tab single search + bulk upload + Unified Report integration
+- Expected output fields (Bug Compliance, Bug Open Count, Bug IDs)
+- API constraints (10/page pagination, 400/404 → Compliant, version fallback)
+- Edge cases (Fixed bugs ignored, NA when no PID)
 
 ---
 
