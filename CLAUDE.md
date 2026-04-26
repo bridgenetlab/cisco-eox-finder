@@ -13,61 +13,270 @@ You're working inside the **WAT framework** (Workflows, Agents, Tools). This arc
 - This is your role. You're responsible for intelligent coordination.
 - Read the relevant workflow, run tools in the correct sequence, handle failures gracefully, and ask clarifying questions when needed
 - You connect intent to execution without trying to do everything yourself
-- Example: If you need to pull data from a website, don't attempt it directly. Read `workflows/scrape_website.md`, figure out the required inputs, then execute `tools/scrape_single_site.py`
+- Example: To look up an EOX record, read `workflows/cisco_eox_lookup.md`, confirm credentials are in `.env`, then run `tools/cisco_eox.py --pid <PID>`
 
 **Layer 3: Tools (The Execution)**
 - Python scripts in `tools/` that do the actual work
-- API calls, data transformations, file operations, database queries
-- Credentials and API keys are stored in `.env`
+- API calls, data transformations, file I/O
+- Credentials and API keys live in `.env` (never hardcoded)
 - These scripts are consistent, testable, and fast
 
 **Why this matters:** When AI tries to handle every step directly, accuracy drops fast. If each step is 90% accurate, you're down to 59% success after just five steps. By offloading execution to deterministic scripts, you stay focused on orchestration and decision-making where you excel.
 
+---
+
+## Project Overview
+
+This is the **Cisco EOX Finder** — a tool for querying Cisco's End-of-Life (EOX) Support API to surface compliance status for network hardware. It has two interfaces:
+
+1. **CLI** (`tools/cisco_eox.py`) — direct terminal lookups by Product ID or Serial Number
+2. **Web App** (`tools/cisco_eox_webapp.py`) — Flask UI for single lookups and bulk Excel enrichment
+
+The app is containerized and published to GHCR via GitHub Actions. It can be self-hosted on Docker or Unraid.
+
+---
+
+## Directory Layout
+
+```
+cisco-eox-finder/
+├── tools/
+│   ├── cisco_eox.py          # Core API client + CLI entry point
+│   ├── cisco_eox_webapp.py   # Flask web app (imports cisco_eox)
+│   └── requirements.txt      # Python dependencies
+├── workflows/
+│   └── cisco_eox_lookup.md   # SOP for EOX data retrieval
+├── .github/
+│   └── workflows/
+│       └── docker-publish.yml  # CI/CD: builds and pushes Docker image to GHCR
+├── Dockerfile                # Single-stage build; runs cisco_eox_webapp.py
+├── docker-compose.yml        # Production deployment config
+├── unraid-template.xml       # Unraid NAS container template
+├── nginx.conf                # Placeholder (unused; Flask serves directly)
+├── .env                      # Secrets — NEVER commit (gitignored)
+├── .gitignore
+└── CLAUDE.md                 # This file
+```
+
+**Temporary files** go in `.tmp/` (gitignored, regenerated as needed). There are no persistent local deliverables — enriched outputs are downloaded by the user directly from the web app.
+
+---
+
+## Tools Reference
+
+### `tools/cisco_eox.py` — Core API Client
+
+The authoritative module for all Cisco EOX V5 API interactions.
+
+**Environment variables required:**
+```
+CISCO_CLIENT_ID=<your-client-id>
+CISCO_CLIENT_SECRET=<your-client-secret>
+```
+
+**Key functions:**
+
+| Function | Purpose |
+|---|---|
+| `get_access_token()` | OAuth2 client credentials flow; in-memory token cache with auto-refresh 60s before expiry |
+| `query_by_product_id(pid, page)` | Query by PID; supports wildcards (`*`) and comma-separated list (max 20) |
+| `query_by_serial_number(sn, page)` | Query by serial number; comma-separated (max 20) |
+| `_parse_eox_record(record)` | Flatten nested API response into a normalized dict |
+| `_compliance_status(last_date_str)` | Derive compliance from Last Date of Support |
+
+**Compliance thresholds** (`WARN_DAYS = 180`):
+
+| Status | Condition |
+|---|---|
+| `noncompliant` | LDoS is in the past |
+| `warning` | LDoS within 0–180 days |
+| `compliant` | LDoS more than 180 days away |
+| `unknown` | Date missing or unparseable |
+
+**Normalized record output:**
+```python
+{
+  "product_id": str,
+  "product_name": str,
+  "end_of_sale": str,              # YYYY-MM-DD
+  "end_of_sw_maintenance": str,
+  "end_of_security_support": str,
+  "end_of_routine_failure": str,
+  "end_of_service_contract": str,
+  "last_date_of_support": str,
+  "compliance": {
+    "status": "compliant" | "warning" | "noncompliant" | "unknown",
+    "label": str,
+    "days_remaining": int | None
+  },
+  "migration_product_id": str,
+  "migration_info": str,
+  "migration_url": str,
+  "bulletin_url": str
+}
+```
+
+**CLI usage:**
+```bash
+cd tools
+python cisco_eox.py --pid WS-C2960X-24TS-L
+python cisco_eox.py --sn FHH12345678
+python cisco_eox.py --pid "WS-C2960*" --page 2   # wildcard (3+ chars required)
+python cisco_eox.py --pid "PID1,PID2" --json      # raw JSON output
+```
+
+**API limits to respect:**
+- Max 20 PIDs or SNs per request
+- Wildcard queries require 3+ characters before `*`
+- OAuth token valid ~1 hour; the cache handles refresh automatically
+- Token cache is in-memory and per-process (not shared across workers)
+
+---
+
+### `tools/cisco_eox_webapp.py` — Flask Web Application
+
+Imports `cisco_eox` as a module. Serves a single-page application with two tabs.
+
+**Routes:**
+
+| Route | Method | Purpose |
+|---|---|---|
+| `/` | GET | Serve embedded HTML/CSS/JS UI |
+| `/search` | POST | Single PID/SN lookup; returns `{results: [...]}` |
+| `/upload` | POST | Accept `.xlsx`/`.xls`, enrich with EOX data, store as job |
+| `/download/<job_id>` | GET | Stream enriched Excel file for download |
+
+**Bulk upload behavior:**
+1. Reads Excel file into a Pandas DataFrame (all columns as strings)
+2. Auto-detects PID column (keywords: "product part", "pid", "part number", "part_no", "model", "pn")
+3. Auto-detects SN column (keywords: "serial number", "s/n", "serial_no", "serial")
+4. Batches unique PIDs in groups of 20 to respect API limits
+5. Appends 7 new columns: End of Sale, End of SW, End of Security, End of Service Contract, Last Date, Compliance, Migration PID
+6. Stores enriched DataFrame in `_jobs` dict (in-memory, UUID key)
+7. Returns job ID and preview data; download triggered separately
+
+**Starting the web app:**
+```bash
+cd tools
+python cisco_eox_webapp.py    # runs on http://localhost:5001
+```
+
+**Limits:** `MAX_CONTENT_LENGTH = 50 MB`
+
+---
+
+## Workflows Reference
+
+### `workflows/cisco_eox_lookup.md`
+
+The SOP for any EOX data retrieval task. Always read this before querying. Key sections:
+- Required inputs and credential setup
+- CLI vs. web app usage paths
+- Expected output field descriptions
+- Compliance rule definitions
+- Pagination instructions for wildcard queries
+- Edge cases: invalid PIDs, missing records, token expiry, rate limits
+- Self-improvement log (append discoveries here)
+
+---
+
+## Dependencies
+
+All dependencies are in `tools/requirements.txt`:
+
+```
+requests>=2.31.0    # HTTP + OAuth2
+flask>=3.0.0        # Web framework
+python-dotenv>=1.0.0  # Load .env
+pandas>=2.0.0       # Excel processing
+openpyxl>=3.1.0     # Excel writer engine
+```
+
+Install:
+```bash
+pip install -r tools/requirements.txt
+```
+
+---
+
+## Deployment
+
+### Local Docker
+
+```bash
+# With docker-compose (recommended)
+CISCO_CLIENT_ID=xxx CISCO_CLIENT_SECRET=yyy docker compose up
+
+# Or pass via .env file in the project root
+docker compose up
+```
+
+The container exposes port **5001** and has a built-in health check (HTTP GET `/` every 30s).
+
+### CI/CD
+
+`.github/workflows/docker-publish.yml` triggers on:
+- Push to `main` or `master` → publishes `latest` tag
+- Version tags (`v*.*.*`) → publishes semver tags
+
+Image published to: `ghcr.io/bridgenetlab/cisco-eox-finder`
+
+### Unraid
+
+Use `unraid-template.xml` via the Unraid Community Applications template system. Requires `CISCO_CLIENT_ID` and `CISCO_CLIENT_SECRET` to be set in the container settings.
+
+---
+
+## Development Conventions
+
+**Code style:**
+- Python 3.11+ type hints in function signatures
+- Docstrings on all public functions
+- No inline comments unless the behavior is non-obvious
+
+**Error handling:**
+- Validate credentials at startup (raise `ValueError` if missing)
+- Gracefully handle missing/malformed date fields (`unknown` status)
+- Do not swallow exceptions silently — let callers see failures
+
+**Adding a new query type:**
+1. Add a new function in `cisco_eox.py` following the `query_by_*` pattern
+2. Add a corresponding route in `cisco_eox_webapp.py` if a UI is needed
+3. Update `workflows/cisco_eox_lookup.md` with the new capability
+
+**No tests directory exists.** Before running any script that makes live API calls, confirm credentials are in `.env` and check with the user if it will consume billable API quota.
+
+**Secrets rule:** `.env` is gitignored. Never put credentials in code, Docker images, or workflow files. Use environment variables passed at runtime.
+
+---
+
 ## How to Operate
 
 **1. Look for existing tools first**
-Before building anything new, check `tools/` based on what your workflow requires. Only create new scripts when nothing exists for that task.
+Before building anything, check `tools/` and the relevant workflow. Only create new scripts when nothing covers the task.
 
 **2. Learn and adapt when things fail**
-When you hit an error:
-- Read the full error message and trace
-- Fix the script and retest (if it uses paid API calls or credits, check with me before running again)
-- Document what you learned in the workflow (rate limits, timing quirks, unexpected behavior)
-- Example: You get rate-limited on an API, so you dig into the docs, discover a batch endpoint, refactor the tool to use it, verify it works, then update the workflow so this never happens again
+- Read the full error trace
+- Fix the script and retest (confirm with the user before re-running paid API calls)
+- Document findings in the workflow's Self-Improvement Log
 
 **3. Keep workflows current**
-Workflows should evolve as you learn. When you find better methods, discover constraints, or encounter recurring issues, update the workflow. That said, don't create or overwrite workflows without asking unless I explicitly tell you to. These are your instructions and need to be preserved and refined, not tossed after one use.
+Update `workflows/cisco_eox_lookup.md` when you discover rate limits, new edge cases, or better approaches. Don't create or overwrite workflows without asking.
+
+---
 
 ## The Self-Improvement Loop
 
-Every failure is a chance to make the system stronger:
 1. Identify what broke
 2. Fix the tool
 3. Verify the fix works
-4. Update the workflow with the new approach
-5. Move on with a more robust system
+4. Update the workflow
+5. Move on with a stronger system
 
-This loop is how the framework improves over time.
-
-## File Structure
-
-**What goes where:**
-- **Deliverables**: Final outputs go to cloud services (Google Sheets, Slides, etc.) where I can access them directly
-- **Intermediates**: Temporary processing files that can be regenerated
-
-**Directory layout:**
-```
-.tmp/           # Temporary files (scraped data, intermediate exports). Regenerated as needed.
-tools/          # Python scripts for deterministic execution
-workflows/      # Markdown SOPs defining what to do and how
-.env            # API keys and environment variables (NEVER store secrets anywhere else)
-credentials.json, token.json  # Google OAuth (gitignored)
-```
-
-**Core principle:** Local files are just for processing. Anything I need to see or use lives in cloud services. Everything in `.tmp/` is disposable.
+---
 
 ## Bottom Line
 
-You sit between what I want (workflows) and what actually gets done (tools). Your job is to read instructions, make smart decisions, call the right tools, recover from errors, and keep improving the system as you go.
+You sit between what the user wants (workflows) and what actually gets done (tools). Read instructions, make smart decisions, call the right scripts, recover from errors, and keep improving the system as you go.
 
 Stay pragmatic. Stay reliable. Keep learning.
