@@ -24,6 +24,7 @@ from flask import Flask, jsonify, render_template_string, request, send_file
 sys.path.insert(0, str(Path(__file__).parent))
 import cisco_eox
 import cisco_bug
+import cisco_config_diff
 import cisco_psirt
 import cisco_sn2info
 import cisco_swim
@@ -524,6 +525,35 @@ thead th.cov-col   { color: #3fb950; }
 thead th.swim-col  { color: #e3b341; }
 thead th.psirt-col { color: #f85149; }
 thead th.bug-col   { color: #a371f7; }
+
+/* Config Diff risk colours */
+.diff-add     { background: rgba(63,185,80,0.06); }
+.diff-remove  { background: rgba(248,81,73,0.06); }
+.diff-sep     { background: transparent; color: #484f58; font-style: italic; }
+.diff-context { color: #6e7681; }
+.risk-critical{ background: rgba(248,81,73,0.18); color: #f85149; border-left: 3px solid #f85149; }
+.risk-high    { background: rgba(227,130,0,0.15);  color: #e37300; border-left: 3px solid #e37300; }
+.risk-medium  { background: rgba(227,179,65,0.12); color: #e3b341; border-left: 3px solid #e3b341; }
+.risk-low     { background: rgba(88,166,255,0.08); color: #8b949e; border-left: 3px solid #30363d; }
+.risk-badge {
+  display: inline-block; padding: 0.1rem 0.45rem; border-radius: 4px;
+  font-size: 0.65rem; font-weight: 700; letter-spacing: 0.4px; white-space: nowrap; margin-left: 0.5rem;
+}
+.rb-critical { background: rgba(248,81,73,0.2);  color: #f85149; }
+.rb-high     { background: rgba(227,130,0,0.2);   color: #e37300; }
+.rb-medium   { background: rgba(227,179,65,0.2);  color: #e3b341; }
+.rb-low      { background: rgba(88,166,255,0.1);  color: #58a6ff; }
+.diff-line-no{ color: #484f58; font-size: 0.7rem; min-width: 3.5rem; text-align: right; padding-right: 0.75rem; user-select: none; }
+.diff-prefix { font-family: monospace; font-weight: 700; width: 1rem; display: inline-block; }
+.diff-content{ font-family: "SF Mono","Fira Code",monospace; font-size: 0.78rem; white-space: pre-wrap; word-break: break-all; }
+.risk-reason { font-size: 0.72rem; color: #8b949e; margin-left: 0.75rem; font-style: italic; }
+.score-badge {
+  padding: 0.35rem 1rem; border-radius: 20px; font-size: 0.85rem; font-weight: 700;
+}
+.score-critical { background: rgba(248,81,73,0.15);  color: #f85149; border: 1px solid rgba(248,81,73,0.4); }
+.score-high     { background: rgba(227,130,0,0.15);   color: #e37300; border: 1px solid rgba(227,130,0,0.4); }
+.score-medium   { background: rgba(227,179,65,0.15);  color: #e3b341; border: 1px solid rgba(227,179,65,0.4); }
+.score-ok       { background: rgba(63,185,80,0.15);   color: #3fb950; border: 1px solid rgba(63,185,80,0.4); }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 </head>
@@ -531,7 +561,7 @@ thead th.bug-col   { color: #a371f7; }
 
 <header>
   <div class="logo">Cisco <span>EOX</span> Finder</div>
-  <p>End-of-Life · SWIM · PSIRT Security · Bugs — Cisco APIs</p>
+  <p>End-of-Life · SWIM · PSIRT Security · Bugs · Config Diff — Cisco APIs</p>
 </header>
 
 <div class="tabs">
@@ -541,6 +571,7 @@ thead th.bug-col   { color: #a371f7; }
   <button class="tab-btn" data-tab="psirt">PSIRT</button>
   <button class="tab-btn" data-tab="unified">Unified Report</button>
   <button class="tab-btn" data-tab="bugs">Bugs</button>
+  <button class="tab-btn" data-tab="configdiff">Config Diff</button>
   <button class="tab-btn" data-tab="dashboard">Dashboard</button>
 </div>
 
@@ -958,6 +989,73 @@ thead th.bug-col   { color: #a371f7; }
   <div id="bugTableWrap" class="table-wrap" style="display:none">
     <table id="bugTable"><thead id="bugThead"></thead><tbody id="bugTbody"></tbody></table>
     <div class="pagination" id="bugPagination"></div>
+  </div>
+</div>
+
+<!-- ── Config Diff Tab ── -->
+<div id="tab-configdiff" class="tab-panel">
+  <div class="card">
+    <h2>Config Diff — Risk Analyzer</h2>
+    <p style="font-size:0.85rem;color:#8b949e;margin:0 0 1rem">
+      Paste or upload two configurations. Each changed line is classified by risk level so you can immediately see what could cause outages or security regressions.
+    </p>
+
+    <div class="form-row">
+      <div>
+        <label for="refConfig">Reference Config <span style="font-weight:400;color:#6e7681">(startup / baseline)</span></label>
+        <textarea id="refConfig" rows="12" style="width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-family:'SF Mono','Fira Code',monospace;font-size:0.78rem;padding:0.6rem 0.75rem;resize:vertical" placeholder="Paste startup/reference config here…&#10;&#10;Or upload a file →"></textarea>
+        <div style="margin-top:0.4rem;display:flex;gap:0.5rem;align-items:center">
+          <label class="btn-secondary" style="cursor:pointer;padding:0.35rem 0.75rem;font-size:0.8rem">
+            📂 Upload File <input type="file" id="refConfigFile" accept=".txt,.cfg,.conf,.log" style="display:none">
+          </label>
+          <button class="btn-secondary" style="font-size:0.8rem;padding:0.35rem 0.75rem" onclick="loadDiffSample('ref')">Load Sample</button>
+          <span id="refFileName" style="font-size:0.75rem;color:#6e7681"></span>
+        </div>
+      </div>
+      <div>
+        <label for="curConfig">Current Config <span style="font-weight:400;color:#6e7681">(running / proposed)</span></label>
+        <textarea id="curConfig" rows="12" style="width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-family:'SF Mono','Fira Code',monospace;font-size:0.78rem;padding:0.6rem 0.75rem;resize:vertical" placeholder="Paste running/current config here…&#10;&#10;Or upload a file →"></textarea>
+        <div style="margin-top:0.4rem;display:flex;gap:0.5rem;align-items:center">
+          <label class="btn-secondary" style="cursor:pointer;padding:0.35rem 0.75rem;font-size:0.8rem">
+            📂 Upload File <input type="file" id="curConfigFile" accept=".txt,.cfg,.conf,.log" style="display:none">
+          </label>
+          <button class="btn-secondary" style="font-size:0.8rem;padding:0.35rem 0.75rem" onclick="loadDiffSample('cur')">Load Sample</button>
+          <span id="curFileName" style="font-size:0.75rem;color:#6e7681"></span>
+        </div>
+      </div>
+    </div>
+
+    <div style="margin-bottom:1rem">
+      <label style="display:inline;margin-right:0.5rem">Minimum Risk Level:</label>
+      <select id="diffMinRisk" style="width:auto;display:inline-block;padding:0.4rem 0.75rem">
+        <option value="info">Show All</option>
+        <option value="low">Low and above</option>
+        <option value="medium">Medium and above</option>
+        <option value="high">High and above</option>
+        <option value="critical">Critical only</option>
+      </select>
+    </div>
+
+    <div class="btn-row">
+      <button id="diffAnalyzeBtn" class="btn-primary">Analyze Risk</button>
+      <button class="btn-secondary" onclick="clearDiff()">Clear</button>
+      <span id="diffStatus" class="status-msg"></span>
+    </div>
+  </div>
+
+  <div id="diffSummaryBar" class="summary-bar" style="display:none"></div>
+
+  <div id="diffDownloadBar" style="max-width:1200px;margin:0 auto 1rem;display:none">
+    <a id="diffDownloadHtml" class="btn-secondary" href="#" onclick="downloadDiffReport();return false">⎙ Download HTML Report</a>
+  </div>
+
+  <div id="diffResultWrap" style="max-width:1200px;margin:0 auto 1.5rem;display:none">
+    <div class="card" style="padding:0;overflow:hidden">
+      <table id="diffTable" style="width:100%;border-collapse:collapse;font-size:0.78rem">
+        <thead id="diffThead"></thead>
+        <tbody id="diffTbody"></tbody>
+      </table>
+    </div>
   </div>
 </div>
 
@@ -2604,6 +2702,260 @@ function renderBugPagination() {
 
 // Trigger dashboard reload when Bugs tab is clicked
 document.querySelector('.tab-btn[data-tab="bugs"]').addEventListener('click', () => { /* standalone tab, no auto-load */ });
+
+// ── Config Diff Risk Analyzer ─────────────────────────────────────────────────
+let _diffResult = null;
+
+// File loaders
+document.getElementById('refConfigFile').addEventListener('change', e => {
+  const f = e.target.files[0]; if (!f) return;
+  document.getElementById('refFileName').textContent = f.name;
+  f.text().then(t => document.getElementById('refConfig').value = t);
+});
+document.getElementById('curConfigFile').addEventListener('change', e => {
+  const f = e.target.files[0]; if (!f) return;
+  document.getElementById('curFileName').textContent = f.name;
+  f.text().then(t => document.getElementById('curConfig').value = t);
+});
+
+function loadDiffSample(side) {
+  const refSample = `version 16.12
+hostname BRANCH-SW1
+!
+aaa authentication login default local
+service password-encryption
+!
+interface GigabitEthernet1/0/1
+ description Uplink to Core
+ no shutdown
+ ip address 10.1.1.1 255.255.255.0
+!
+interface GigabitEthernet1/0/13
+!
+ip access-list extended MGMT-IN
+ permit tcp 10.0.0.0 0.0.0.255 any eq 22
+ deny   ip any any log
+!
+router ospf 1
+ network 10.0.0.0 0.255.255.255 area 0
+!
+spanning-tree mode rapid-pvst
+ntp server 10.0.0.1
+logging host 10.0.0.2
+`;
+  const curSample = `version 16.12
+hostname BRANCH-SW1
+!
+service password-encryption
+!
+interface GigabitEthernet1/0/1
+ description Uplink to Core
+ no shutdown
+ ip address 10.1.1.2 255.255.255.0
+!
+interface GigabitEthernet1/0/13
+ description Triggering Compliance Check
+!
+no ip access-list extended MGMT-IN
+ip access-list extended MGMT-IN
+ permit ip any any
+!
+router ospf 1
+ network 10.0.0.0 0.255.255.255 area 0
+!
+spanning-tree mode rapid-pvst
+ntp server 10.0.0.1
+`;
+  if (side === 'ref') document.getElementById('refConfig').value = refSample.trim();
+  else                document.getElementById('curConfig').value = curSample.trim();
+}
+
+function clearDiff() {
+  document.getElementById('refConfig').value = '';
+  document.getElementById('curConfig').value = '';
+  document.getElementById('refFileName').textContent = '';
+  document.getElementById('curFileName').textContent = '';
+  document.getElementById('diffStatus').textContent = '';
+  document.getElementById('diffSummaryBar').style.display = 'none';
+  document.getElementById('diffDownloadBar').style.display = 'none';
+  document.getElementById('diffResultWrap').style.display = 'none';
+  _diffResult = null;
+}
+
+document.getElementById('diffAnalyzeBtn').addEventListener('click', async () => {
+  const ref = document.getElementById('refConfig').value.trim();
+  const cur = document.getElementById('curConfig').value.trim();
+  const status = document.getElementById('diffStatus');
+  if (!ref || !cur) { status.textContent = 'Paste or upload both configs first.'; return; }
+
+  const btn = document.getElementById('diffAnalyzeBtn');
+  btn.disabled = true;
+  status.textContent = 'Analyzing…';
+
+  try {
+    const resp = await fetch('/config-diff/analyze', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        reference: ref,
+        current:   cur,
+        min_risk:  document.getElementById('diffMinRisk').value,
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) { status.textContent = 'Error: ' + (data.error || 'Unknown'); return; }
+    _diffResult = data;
+    status.textContent = '';
+    renderDiffResult(data);
+  } catch(err) {
+    status.textContent = 'Network error: ' + err.message;
+  } finally { btn.disabled = false; }
+});
+
+function riskRowClass(level, action) {
+  if (action === 'separator') return 'diff-sep';
+  if (action === 'context')   return 'diff-context';
+  if (level === 'critical')   return 'diff-add risk-critical';
+  if (level === 'high')       return 'diff-add risk-high';
+  if (level === 'medium')     return action === 'remove' ? 'diff-remove risk-medium' : 'diff-add risk-medium';
+  if (level === 'low')        return action === 'remove' ? 'diff-remove risk-low' : 'diff-add risk-low';
+  return action === 'add' ? 'diff-add' : action === 'remove' ? 'diff-remove' : '';
+}
+
+function riskBadgeHtml(level, reason) {
+  if (!reason) return '';
+  const cls = {critical:'rb-critical', high:'rb-high', medium:'rb-medium', low:'rb-low'}[level] || '';
+  const label = {critical:'CRITICAL',high:'HIGH',medium:'MEDIUM',low:'LOW'}[level] || '';
+  return `<span class="risk-badge ${cls}">${label}</span><span class="risk-reason">${reason}</span>`;
+}
+
+function scoreBadgeClass(score) {
+  if (score >= 20) return 'score-critical';
+  if (score >= 10) return 'score-high';
+  if (score >= 3)  return 'score-medium';
+  return 'score-ok';
+}
+
+function renderDiffResult(data) {
+  const s = data.summary;
+  const score = data.risk_score;
+
+  // Summary bar
+  const bar = document.getElementById('diffSummaryBar');
+  bar.style.display = 'flex';
+  bar.innerHTML = `
+    <span class="score-badge ${scoreBadgeClass(score)}">Risk Score: ${score}</span>
+    <span class="pill pill-total">${s.total_changes} Changes (+${s.lines_added} / -${s.lines_removed})</span>
+    ${s.critical ? `<span class="pill pill-nc">${s.critical} Critical</span>` : ''}
+    ${s.high     ? `<span class="pill" style="background:rgba(227,130,0,.1);color:#e37300;border:1px solid rgba(227,130,0,.3)">${s.high} High</span>` : ''}
+    ${s.medium   ? `<span class="pill pill-w">${s.medium} Medium</span>` : ''}
+    ${s.low      ? `<span class="pill pill-uk">${s.low} Low</span>` : ''}
+    ${!s.critical && !s.high && !s.medium && !s.low ? '<span class="pill pill-c">No Risk Patterns Detected</span>' : ''}`;
+
+  // Table
+  const tbody = document.getElementById('diffTbody');
+  document.getElementById('diffThead').innerHTML = `<tr>
+    <th style="padding:0.4rem 0.6rem;color:#8b949e;border-bottom:1px solid #30363d;width:3.5rem;text-align:right">Ref#</th>
+    <th style="padding:0.4rem 0.6rem;color:#8b949e;border-bottom:1px solid #30363d;width:3.5rem;text-align:right">Cur#</th>
+    <th style="padding:0.4rem 0.6rem;color:#8b949e;border-bottom:1px solid #30363d;width:1.2rem"></th>
+    <th style="padding:0.4rem 0.6rem;color:#8b949e;border-bottom:1px solid #30363d">Config Line</th>
+    <th style="padding:0.4rem 0.6rem;color:#8b949e;border-bottom:1px solid #30363d">Risk</th>
+  </tr>`;
+
+  let rows = '';
+  for (const c of data.changes) {
+    const rowCls = riskRowClass(c.risk_level, c.action);
+    const prefix = c.action === 'add' ? '+' : c.action === 'remove' ? '−' : c.action === 'separator' ? '⋯' : ' ';
+    const prefixColor = c.action === 'add' ? '#3fb950' : c.action === 'remove' ? '#f85149' : '#484f58';
+    const content = c.content.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const refNo = c.ref_line_no || '';
+    const curNo = c.cur_line_no || '';
+
+    if (c.action === 'separator') {
+      rows += `<tr class="${rowCls}"><td colspan="5" style="padding:0.25rem 0.75rem;text-align:center;color:#484f58;font-style:italic;font-size:0.72rem">${content}</td></tr>`;
+      continue;
+    }
+
+    rows += `<tr class="${rowCls}" style="border-bottom:1px solid #1c2128">
+      <td style="padding:0.3rem 0.6rem;color:#484f58;font-size:0.7rem;text-align:right;font-family:monospace">${refNo}</td>
+      <td style="padding:0.3rem 0.6rem;color:#484f58;font-size:0.7rem;text-align:right;font-family:monospace">${curNo}</td>
+      <td style="padding:0.3rem 0.5rem;font-family:monospace;font-weight:700;color:${prefixColor}">${prefix}</td>
+      <td style="padding:0.3rem 0.6rem"><span class="diff-content">${content}</span></td>
+      <td style="padding:0.3rem 0.6rem;white-space:nowrap">${riskBadgeHtml(c.risk_level, c.risk_reason)}</td>
+    </tr>`;
+  }
+  tbody.innerHTML = rows || '<tr><td colspan="5" style="padding:1rem;text-align:center;color:#6e7681">No differences found — configurations are identical.</td></tr>';
+
+  document.getElementById('diffResultWrap').style.display = 'block';
+  document.getElementById('diffDownloadBar').style.display = 'block';
+}
+
+function downloadDiffReport() {
+  if (!_diffResult) return;
+  const ref = document.getElementById('refConfig').value;
+  const cur = document.getElementById('curConfig').value;
+  const s = _diffResult.summary;
+  const score = _diffResult.risk_score;
+
+  const riskColor = {critical:'#f85149',high:'#e37300',medium:'#e3b341',low:'#58a6ff',info:'#6e7681'};
+  const rowBg = c => {
+    if (c.action === 'separator') return '#0d1117';
+    if (c.risk_level === 'critical') return 'rgba(248,81,73,0.12)';
+    if (c.risk_level === 'high')     return 'rgba(227,130,0,0.10)';
+    if (c.risk_level === 'medium')   return 'rgba(227,179,65,0.08)';
+    if (c.risk_level === 'low')      return 'rgba(88,166,255,0.06)';
+    return c.action === 'add' ? 'rgba(63,185,80,0.04)' : c.action === 'remove' ? 'rgba(248,81,73,0.04)' : 'transparent';
+  };
+
+  let tableRows = '';
+  for (const c of _diffResult.changes) {
+    const bg = rowBg(c);
+    const prefix = c.action==='add'?'+':c.action==='remove'?'−':' ';
+    const col = c.action==='add'?'#3fb950':c.action==='remove'?'#f85149':'#484f58';
+    const content = (c.content||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const rc = riskColor[c.risk_level] || '#6e7681';
+    const badge = c.risk_reason ? `<span style="background:${rc}22;color:${rc};padding:0.1rem 0.4rem;border-radius:3px;font-size:0.65rem;font-weight:700;margin-left:0.5rem">${(c.risk_level||'').toUpperCase()}</span><span style="color:#8b949e;font-size:0.7rem;margin-left:0.5rem;font-style:italic">${c.risk_reason}</span>` : '';
+    if (c.action === 'separator') {
+      tableRows += `<tr><td colspan="5" style="padding:0.25rem;text-align:center;color:#484f58;font-style:italic;font-size:0.72rem">${content}</td></tr>`;
+    } else {
+      tableRows += `<tr style="background:${bg};border-bottom:1px solid #1c2128">
+        <td style="padding:0.25rem 0.5rem;color:#484f58;font-family:monospace;font-size:0.68rem;text-align:right">${c.ref_line_no||''}</td>
+        <td style="padding:0.25rem 0.5rem;color:#484f58;font-family:monospace;font-size:0.68rem;text-align:right">${c.cur_line_no||''}</td>
+        <td style="padding:0.25rem 0.5rem;font-family:monospace;font-weight:700;color:${col}">${prefix}</td>
+        <td style="padding:0.25rem 0.5rem;font-family:monospace;font-size:0.75rem;white-space:pre-wrap;word-break:break-all">${content}</td>
+        <td style="padding:0.25rem 0.5rem;white-space:nowrap">${badge}</td>
+      </tr>`;
+    }
+  }
+
+  const now = new Date().toISOString().replace('T',' ').slice(0,19) + ' UTC';
+  const scoreLabel = score >= 20 ? 'CRITICAL' : score >= 10 ? 'HIGH' : score >= 3 ? 'MEDIUM' : 'LOW';
+  const scoreCol   = score >= 20 ? '#f85149' : score >= 10 ? '#e37300' : score >= 3 ? '#e3b341' : '#3fb950';
+
+  const html = `<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>Config Diff Risk Report</title>
+<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d1117;color:#c9d1d9;margin:0;padding:1.5rem;font-size:0.82rem}
+h1{color:#e6edf3;font-size:1.2rem;margin-bottom:0.25rem}.meta{color:#6e7681;font-size:0.75rem;margin-bottom:1rem}
+.pills{display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:1.5rem}.pill{padding:0.3rem 0.75rem;border-radius:20px;font-size:0.78rem;font-weight:700}
+table{border-collapse:collapse;width:100%;font-size:0.78rem}th{background:#161b22;color:#8b949e;padding:0.4rem 0.6rem;text-align:left;border-bottom:2px solid #30363d}
+td{padding:0.3rem 0.5rem;vertical-align:top}</style></head><body>
+<h1>Cisco Config Diff — Risk Analysis Report</h1>
+<p class="meta">Generated ${now} · +${s.lines_added} added / −${s.lines_removed} removed · ${s.total_changes} total changes</p>
+<div class="pills">
+  <span class="pill" style="background:${scoreCol}22;color:${scoreCol};border:1px solid ${scoreCol}55">Risk Score: ${score} (${scoreLabel})</span>
+  ${s.critical?`<span class="pill" style="background:#f8514922;color:#f85149;border:1px solid #f8514955">${s.critical} Critical</span>`:''}
+  ${s.high?`<span class="pill" style="background:#e3730022;color:#e37300;border:1px solid #e3730055">${s.high} High</span>`:''}
+  ${s.medium?`<span class="pill" style="background:#e3b34122;color:#e3b341;border:1px solid #e3b34155">${s.medium} Medium</span>`:''}
+  ${s.low?`<span class="pill" style="background:#58a6ff22;color:#58a6ff;border:1px solid #58a6ff55">${s.low} Low</span>`:''}
+</div>
+<table><thead><tr><th>Ref#</th><th>Cur#</th><th></th><th>Config Line</th><th>Risk</th></tr></thead>
+<tbody>${tableRows}</tbody></table></body></html>`;
+
+  const blob = new Blob([html], {type:'text/html'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'cisco_config_diff_report.html';
+  a.click();
+}
 </script>
 </body>
 </html>
@@ -3190,6 +3542,29 @@ def bug_html(job_id: str):
     if df is None:
         return "Job not found or expired", 404
     return _generate_html_report(df, "Bug Compliance Report"), 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+@app.route("/config-diff/analyze", methods=["POST"])
+def config_diff_analyze():
+    data = request.get_json(force=True)
+    reference = (data.get("reference") or "").strip()
+    current   = (data.get("current")   or "").strip()
+    min_risk  = (data.get("min_risk")  or "info").strip().lower()
+    if not reference or not current:
+        return jsonify({"error": "Both 'reference' and 'current' config text are required"}), 400
+
+    ref_lines = reference.splitlines(keepends=True)
+    cur_lines = current.splitlines(keepends=True)
+    result    = cisco_config_diff.analyze_diff(ref_lines, cur_lines)
+
+    # Apply min_risk filter on the changes list (keep context/separator for display)
+    min_rank = cisco_config_diff.RISK_ORDER.get(min_risk, 0)
+    result["changes"] = [
+        c for c in result["changes"]
+        if c["action"] in ("context", "separator")
+        or cisco_config_diff.RISK_ORDER.get(c["risk_level"], 0) >= min_rank
+    ]
+    return jsonify(result)
 
 
 @app.route("/unified/upload", methods=["POST"])

@@ -108,14 +108,16 @@ cisco-eox-finder/
 │   ├── cisco_psirt.py        # PSIRT openVuln API client + CLI entry point
 │   ├── cisco_sn2info.py      # SN2INFO contract coverage + PID resolution client + CLI
 │   ├── cisco_bug.py          # Bug API v2.0 client + CLI entry point
-│   ├── cisco_eox_webapp.py   # Flask web app (imports all five clients above)
+│   ├── cisco_config_diff.py  # Config diff + risk analyzer (no API credentials needed)
+│   ├── cisco_eox_webapp.py   # Flask web app (imports all clients above)
 │   └── requirements.txt      # Python dependencies
 ├── workflows/
 │   ├── cisco_eox_lookup.md      # SOP for EOX data retrieval
 │   ├── cisco_swim_lookup.md     # SOP for SWIM software suggestion lookup
 │   ├── cisco_psirt_lookup.md    # SOP for PSIRT security advisory lookup
 │   ├── cisco_sn2info_lookup.md  # SOP for SN2INFO contract coverage + PID resolution
-│   └── cisco_bug_lookup.md      # SOP for Bug API v2.0 lookup
+│   ├── cisco_bug_lookup.md      # SOP for Bug API v2.0 lookup
+│   └── cisco_config_diff.md     # SOP for Config Diff Risk Analyzer
 ├── .github/
 │   └── workflows/
 │       └── docker-publish.yml  # CI/CD: builds and pushes Docker image to GHCR
@@ -448,6 +450,7 @@ Imports `cisco_eox`, `cisco_swim`, `cisco_psirt`, `cisco_sn2info`, and `cisco_bu
 | `/bug/upload` | POST | Accept `.xlsx`/`.csv`, enrich with Bug compliance data |
 | `/bug/download/<job_id>` | GET | Stream Bug-enriched Excel for download |
 | `/bug/html/<job_id>` | GET | HTML report for a Bug job |
+| `/config-diff/analyze` | POST | Accept two config text blocks, return risk-annotated diff |
 | `/unified/upload` | POST | Accept `.xlsx`/`.csv`, enrich with EOX + Coverage + SWIM + PSIRT + Bug data |
 | `/unified/download/<job_id>` | GET | Stream unified report Excel for download |
 
