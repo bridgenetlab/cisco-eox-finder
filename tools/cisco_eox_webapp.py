@@ -807,6 +807,7 @@ thead th.tag-col { color: #79c0ff; }
   <button class="tab-btn" data-tab="unified">Unified Report</button>
   <button class="tab-btn" data-tab="bugs">Bugs</button>
   <button class="tab-btn" data-tab="configdiff">Config Diff</button>
+  <button class="tab-btn" data-tab="vendor">Multi-Vendor EoL</button>
   <button class="tab-btn" data-tab="dashboard">Dashboard</button>
 </div>
 
@@ -1493,6 +1494,51 @@ thead th.tag-col { color: #79c0ff; }
       <div id="baselinesListWrap">
         <p style="color:#6e7681;font-size:0.85rem">No baselines saved yet. Paste a config in the Reference pane above and click <strong>💾 Save as Baseline</strong>.</p>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Multi-Vendor EoL Tab ── -->
+<div id="tab-vendor" class="tab-panel">
+  <div class="card" style="max-width:900px;margin:0 auto 1.5rem">
+    <h2 style="margin-top:0">Multi-Vendor End-of-Life Lookup</h2>
+    <p style="font-size:0.85rem;color:#8b949e;margin:0 0 1rem">
+      Look up EoL milestones for networking products from any vendor — Juniper, Palo Alto, Aruba, Fortinet, and more.
+      Data is sourced from <strong>endoflife.date</strong> (open, community-maintained, no API key required).
+    </p>
+    <div style="display:flex;gap:0.75rem;align-items:flex-end;flex-wrap:wrap;margin-bottom:1rem">
+      <div style="flex:1;min-width:200px">
+        <label style="display:block;font-size:0.8rem;color:#8b949e;margin-bottom:0.3rem">Product / Vendor Slug</label>
+        <input id="vendorProductInput" type="text" placeholder="e.g. junos, panos, fortios, aruba-arubaos-cx…"
+          style="width:100%;box-sizing:border-box;background:#161b22;border:1px solid #30363d;border-radius:4px;color:#c9d1d9;padding:0.4rem 0.75rem;font-size:0.85rem"
+          onkeydown="if(event.key==='Enter')lookupVendorEol()">
+      </div>
+      <button class="btn-primary" onclick="lookupVendorEol()">Look Up</button>
+    </div>
+    <div style="margin-bottom:1rem">
+      <span style="font-size:0.78rem;color:#6e7681">Quick picks: </span>
+      <span id="vendorQuickPicks" style="display:inline-flex;gap:0.35rem;flex-wrap:wrap"></span>
+    </div>
+    <span id="vendorStatus" class="status-msg"></span>
+  </div>
+  <div id="vendorResultWrap" style="max-width:900px;margin:0 auto 1.5rem;display:none">
+    <div class="card" style="padding:0;overflow:hidden">
+      <div id="vendorResultHeader" style="padding:0.75rem 1rem;background:#161b22;border-bottom:1px solid #30363d;display:flex;align-items:center;gap:0.75rem">
+        <span id="vendorResultTitle" style="font-weight:700;font-size:0.95rem"></span>
+        <a id="vendorResultLink" href="#" target="_blank" style="font-size:0.75rem;color:#58a6ff">endoflife.date ↗</a>
+      </div>
+      <div class="table-wrap" style="max-height:none">
+        <table style="width:100%;border-collapse:collapse;font-size:0.8rem">
+          <thead id="vendorThead"></thead>
+          <tbody id="vendorTbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <div id="vendorAllProductsWrap" style="max-width:900px;margin:0 auto 1.5rem;display:none">
+    <div class="card">
+      <h3 style="margin-top:0;font-size:0.9rem">Available Products</h3>
+      <div id="vendorAllProductsList" style="font-size:0.8rem;color:#8b949e;line-height:2;max-height:200px;overflow-y:auto"></div>
     </div>
   </div>
 </div>
@@ -3292,6 +3338,89 @@ document.querySelector('.tab-btn[data-tab="dashboard"]').addEventListener('click
   loadDashboard();
   loadEmailConfig();
 });
+
+// ── Multi-Vendor EoL ─────────────────────────────────────────────────────────
+const _VENDOR_QUICK = [
+  {label:'Juniper JunOS',  slug:'junos'},
+  {label:'Palo Alto PAN-OS', slug:'panos'},
+  {label:'FortiOS',        slug:'fortios'},
+  {label:'Aruba ArubaOS-CX', slug:'aruba-arubaos-cx'},
+  {label:'F5 BIG-IP',      slug:'f5-big-ip'},
+  {label:'pfSense',        slug:'pfsense'},
+  {label:'OPNsense',       slug:'opnsense'},
+  {label:'Ubuntu',         slug:'ubuntu'},
+  {label:'Red Hat EL',     slug:'rhel'},
+  {label:'VMware ESXi',    slug:'esxi'},
+];
+
+(function initVendorTab() {
+  const picks = document.getElementById('vendorQuickPicks');
+  if (picks) {
+    picks.innerHTML = _VENDOR_QUICK.map(p =>
+      `<span class="tag-pill" style="cursor:pointer;color:#58a6ff;border-color:#58a6ff44;background:#58a6ff11"
+         onclick="document.getElementById('vendorProductInput').value='${p.slug}';lookupVendorEol()">${p.label}</span>`
+    ).join('');
+  }
+})();
+
+async function lookupVendorEol() {
+  const slug = (document.getElementById('vendorProductInput').value || '').trim().toLowerCase();
+  const status = document.getElementById('vendorStatus');
+  const wrap = document.getElementById('vendorResultWrap');
+  if (!slug) { status.textContent = 'Enter a product slug (e.g. junos, panos).'; return; }
+  status.textContent = 'Looking up…';
+  wrap.style.display = 'none';
+  try {
+    const resp = await fetch(`/vendor-eol/${encodeURIComponent(slug)}`);
+    const data = await resp.json();
+    if (data.error) { status.textContent = '⚠ ' + data.error; return; }
+    status.textContent = '';
+    renderVendorEolResult(slug, data.cycles || []);
+  } catch(e) {
+    status.textContent = '⚠ Request failed: ' + e;
+  }
+}
+
+function renderVendorEolResult(slug, cycles) {
+  if (!cycles.length) {
+    document.getElementById('vendorStatus').textContent = 'No data returned for this product.';
+    return;
+  }
+  document.getElementById('vendorResultTitle').textContent = slug;
+  document.getElementById('vendorResultLink').href = `https://endoflife.date/${slug}`;
+
+  // Determine columns from first cycle object
+  const keys = Object.keys(cycles[0]);
+  const today = new Date().toISOString().slice(0, 10);
+
+  const isDateKey = k => /date|eol|support|lts/i.test(k) && typeof cycles[0][k] === 'string' && /^\d{4}-\d{2}-\d{2}/.test(cycles[0][k] || '');
+  const dateKeys = keys.filter(isDateKey);
+
+  function fmtCell(k, v) {
+    if (v === null || v === undefined) return '<span style="color:#6e7681">—</span>';
+    if (typeof v === 'boolean') return v ? '<span style="color:#3fb950">✓</span>' : '<span style="color:#6e7681">✗</span>';
+    const s = String(v);
+    // Date cell: colour based on past/future
+    if (dateKeys.includes(k) && /^\d{4}-\d{2}-\d{2}/.test(s)) {
+      const past = s < today;
+      const soon = !past && s <= new Date(Date.now() + 180*864e5).toISOString().slice(0,10);
+      const col = past ? '#f85149' : soon ? '#e3b341' : '#3fb950';
+      return `<span style="color:${col}">${s}</span>`;
+    }
+    return s.replace(/</g,'&lt;');
+  }
+
+  const pretty = k => k.replace(/([A-Z])/g,' $1').replace(/_/g,' ').trim().replace(/^\w/, c=>c.toUpperCase());
+  document.getElementById('vendorThead').innerHTML =
+    '<tr style="background:#161b22">' + keys.map(k => `<th style="padding:0.4rem 0.6rem;color:#8b949e;white-space:nowrap;border-bottom:2px solid #30363d;text-align:left">${pretty(k)}</th>`).join('') + '</tr>';
+  document.getElementById('vendorTbody').innerHTML = cycles.map(c =>
+    '<tr style="border-bottom:1px solid #21262d">' + keys.map(k =>
+      `<td style="padding:0.35rem 0.6rem">${fmtCell(k, c[k])}</td>`
+    ).join('') + '</tr>'
+  ).join('');
+
+  document.getElementById('vendorResultWrap').style.display = 'block';
+}
 
 async function loadDashboard() {
   try {
@@ -5614,6 +5743,37 @@ def settings_test_email():
     if err:
         return jsonify({"ok": False, "error": err}), 500
     return jsonify({"ok": True, "sent_to": _ALERT_TO})
+
+
+# ── Multi-vendor EoL (endoflife.date proxy) ──────────────────────────────────
+_EOL_DATE_BASE = "https://endoflife.date/api"
+
+
+@app.route("/vendor-eol/products")
+def vendor_eol_products():
+    """Return the list of all products available on endoflife.date."""
+    try:
+        import requests as _req
+        resp = _req.get(f"{_EOL_DATE_BASE}/all.json", timeout=10)
+        resp.raise_for_status()
+        return jsonify(resp.json())
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 502
+
+
+@app.route("/vendor-eol/<product>")
+def vendor_eol_lookup(product: str):
+    """Proxy a single product's EoL data from endoflife.date."""
+    product = product.lower().strip()
+    try:
+        import requests as _req
+        resp = _req.get(f"{_EOL_DATE_BASE}/{product}.json", timeout=10)
+        if resp.status_code == 404:
+            return jsonify({"error": f"Product '{product}' not found on endoflife.date"}), 404
+        resp.raise_for_status()
+        return jsonify({"product": product, "cycles": resp.json()})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 502
 
 
 # ── REST API v1 ───────────────────────────────────────────────────────────────
