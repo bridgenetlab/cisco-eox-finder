@@ -791,6 +791,7 @@ thead th.tag-col { color: #79c0ff; }
 .score-ok       { background: rgba(63,185,80,0.15);   color: #3fb950; border: 1px solid rgba(63,185,80,0.4); }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/vis-network@9/standalone/umd/vis-network.min.js"></script>
 </head>
 <body>
 
@@ -808,6 +809,7 @@ thead th.tag-col { color: #79c0ff; }
   <button class="tab-btn" data-tab="bugs">Bugs</button>
   <button class="tab-btn" data-tab="configdiff">Config Diff</button>
   <button class="tab-btn" data-tab="vendor">Multi-Vendor EoL</button>
+  <button class="tab-btn" data-tab="topology">Topology</button>
   <button class="tab-btn" data-tab="dashboard">Dashboard</button>
 </div>
 
@@ -1539,6 +1541,54 @@ thead th.tag-col { color: #79c0ff; }
     <div class="card">
       <h3 style="margin-top:0;font-size:0.9rem">Available Products</h3>
       <div id="vendorAllProductsList" style="font-size:0.8rem;color:#8b949e;line-height:2;max-height:200px;overflow-y:auto"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Topology Tab ── -->
+<div id="tab-topology" class="tab-panel">
+  <div class="card" style="max-width:1100px;margin:0 auto 1rem">
+    <div style="display:flex;align-items:center;gap:1rem;flex-wrap:wrap">
+      <h2 style="margin:0;flex:1">Network Topology View</h2>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+        <label style="font-size:0.8rem;color:#8b949e">Color by:</label>
+        <select id="topoColorBy" onchange="renderTopology()"
+          style="background:#161b22;border:1px solid #30363d;border-radius:4px;color:#c9d1d9;padding:0.25rem 0.6rem;font-size:0.8rem">
+          <option value="urgency">Urgency Level</option>
+          <option value="eox">EOX Compliance</option>
+          <option value="coverage">Coverage Status</option>
+          <option value="tag">Tag (first tag)</option>
+        </select>
+        <label style="font-size:0.8rem;color:#8b949e;margin-left:0.5rem">Group by:</label>
+        <select id="topoGroupBy" onchange="renderTopology()"
+          style="background:#161b22;border:1px solid #30363d;border-radius:4px;color:#c9d1d9;padding:0.25rem 0.6rem;font-size:0.8rem">
+          <option value="none">None</option>
+          <option value="tag">Tag</option>
+          <option value="urgency">Urgency Level</option>
+          <option value="eox">EOX Status</option>
+        </select>
+        <button class="btn-secondary" onclick="topoFitView()" style="padding:0.25rem 0.6rem;font-size:0.8rem">⊞ Fit</button>
+        <button class="btn-secondary" onclick="topoReLayout()" style="padding:0.25rem 0.6rem;font-size:0.8rem">⟳ Re-layout</button>
+      </div>
+    </div>
+    <p id="topoHint" style="font-size:0.82rem;color:#8b949e;margin:0.5rem 0 0">
+      Load a Unified Report first to populate the topology. Nodes are coloured by compliance status. Click a node to inspect it.
+    </p>
+  </div>
+  <div style="max-width:1100px;margin:0 auto;display:flex;gap:1rem;flex-wrap:wrap">
+    <div style="flex:1;min-width:300px">
+      <div id="topoCanvas" style="height:550px;background:#0d1117;border:1px solid #30363d;border-radius:8px;position:relative;overflow:hidden"></div>
+      <div style="margin-top:0.5rem;display:flex;gap:0.75rem;flex-wrap:wrap;font-size:0.75rem" id="topoLegend"></div>
+    </div>
+    <div id="topoSidebar" style="width:270px;flex-shrink:0;display:none">
+      <div class="card" style="font-size:0.82rem">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.75rem">
+          <span style="font-weight:700;color:#e6edf3" id="topoSidebarTitle">Device</span>
+          <button onclick="document.getElementById('topoSidebar').style.display='none'"
+            style="background:none;border:none;color:#6e7681;cursor:pointer;font-size:1rem">✕</button>
+        </div>
+        <div id="topoSidebarContent"></div>
+      </div>
     </div>
   </div>
 </div>
@@ -2968,6 +3018,8 @@ async function doUnifiedUpload(extraFields = {}) {
     renderUnifiedSummary(data.stats);
     renderUnifiedTable();
     fetchAllDeviceTags();
+    // Invalidate cached topology so next tab visit re-renders with fresh data
+    if (_topoNetwork) { _topoNetwork.destroy(); _topoNetwork = null; }
 
     document.getElementById('unifiedDownloadLink').href     = `/unified/download/${data.job_id}`;
     document.getElementById('unifiedDownloadHtmlLink').href = `/unified/html/${data.job_id}`;
@@ -3339,6 +3391,11 @@ document.querySelector('.tab-btn[data-tab="dashboard"]').addEventListener('click
   loadEmailConfig();
 });
 
+document.querySelector('.tab-btn[data-tab="topology"]').addEventListener('click', () => {
+  // Small delay so the container is visible before vis-network measures it
+  setTimeout(renderTopology, 50);
+});
+
 // ── Multi-Vendor EoL ─────────────────────────────────────────────────────────
 const _VENDOR_QUICK = [
   {label:'Juniper JunOS',  slug:'junos'},
@@ -3420,6 +3477,191 @@ function renderVendorEolResult(slug, cycles) {
   ).join('');
 
   document.getElementById('vendorResultWrap').style.display = 'block';
+}
+
+// ── Network Topology View ──────────────────────────────────────────────────
+let _topoNetwork = null;
+let _topoNodes   = null;
+let _topoEdges   = null;
+
+const _TOPO_COLORS = {
+  urgency: {
+    Critical: '#f85149', High: '#d29922', Medium: '#388bfd', Low: '#3fb950', default: '#6e7681'
+  },
+  eox: {
+    noncompliant: '#f85149', warning: '#e3b341', compliant: '#3fb950', default: '#6e7681'
+  },
+  coverage: { active: '#3fb950', inactive: '#f85149', default: '#6e7681' },
+};
+
+function _nodeColor(row, colorBy) {
+  if (colorBy === 'urgency') {
+    const l = (row['Urgency Level'] || '').trim();
+    return _TOPO_COLORS.urgency[l] || _TOPO_COLORS.urgency.default;
+  }
+  if (colorBy === 'eox') {
+    const v = (row['EOX Compliance'] || '').toLowerCase();
+    if (v.includes('noncompliant') || v.includes('non-compliant')) return _TOPO_COLORS.eox.noncompliant;
+    if (v.includes('warning')) return _TOPO_COLORS.eox.warning;
+    if (v.includes('compliant')) return _TOPO_COLORS.eox.compliant;
+    return _TOPO_COLORS.eox.default;
+  }
+  if (colorBy === 'coverage') {
+    const v = (row['Coverage Status'] || '').toLowerCase();
+    if (v === 'active') return _TOPO_COLORS.coverage.active;
+    if (v === 'inactive') return _TOPO_COLORS.coverage.inactive;
+    return _TOPO_COLORS.coverage.default;
+  }
+  if (colorBy === 'tag') {
+    const did = _rowDeviceId(row);
+    const tags = _deviceTags[did] || [];
+    if (!tags.length) return '#6e7681';
+    // Hash tag name to a color
+    const h = [...tags[0]].reduce((a,c)=>a+c.charCodeAt(0),0) % 360;
+    return `hsl(${h},60%,55%)`;
+  }
+  return '#6e7681';
+}
+
+function _nodeLabel(row) {
+  const pid = unifiedPidCol ? (row[unifiedPidCol] || '') : '';
+  const sn  = unifiedSnCol  ? (row[unifiedSnCol]  || '') : '';
+  return (pid || sn || 'Unknown').toString().slice(0, 20);
+}
+
+function _groupKey(row, groupBy) {
+  if (groupBy === 'none')    return 'all';
+  if (groupBy === 'urgency') return (row['Urgency Level'] || 'Unknown').trim();
+  if (groupBy === 'eox') {
+    const v = (row['EOX Compliance'] || 'Unknown').toLowerCase();
+    if (v.includes('noncompliant') || v.includes('non-compliant')) return 'Non-Compliant';
+    if (v.includes('warning'))  return 'Warning';
+    if (v.includes('compliant')) return 'Compliant';
+    return 'Unknown';
+  }
+  if (groupBy === 'tag') {
+    const did = _rowDeviceId(row);
+    const tags = _deviceTags[did] || [];
+    return tags[0] || 'Untagged';
+  }
+  return 'all';
+}
+
+function renderTopology() {
+  const colorBy  = document.getElementById('topoColorBy').value;
+  const groupBy  = document.getElementById('topoGroupBy').value;
+  const source   = unifiedRows.length ? unifiedRows : [];
+  const hint     = document.getElementById('topoHint');
+
+  if (!source.length) {
+    hint.textContent = 'Load a Unified Report first to populate the topology.';
+    return;
+  }
+  hint.textContent = `Showing ${source.length} device${source.length!==1?'s':''} — click a node to inspect.`;
+
+  // Build vis-network dataset
+  const groups = {};
+  const nodesData = source.map((row, idx) => {
+    const gk  = _groupKey(row, groupBy);
+    if (!groups[gk]) groups[gk] = Object.keys(groups).length + 1;
+    const col = _nodeColor(row, colorBy);
+    return {
+      id: idx,
+      label: _nodeLabel(row),
+      color: { background: col + '33', border: col, highlight: { background: col + '55', border: col } },
+      font:  { color: '#c9d1d9', size: 11 },
+      group: groups[gk],
+      row,
+    };
+  });
+
+  // Simple edge heuristic: connect nodes in the same group
+  const edgesData = [];
+  if (groupBy !== 'none') {
+    const byGroup = {};
+    nodesData.forEach(n => {
+      const gk = _groupKey(n.row, groupBy);
+      (byGroup[gk] = byGroup[gk]||[]).push(n.id);
+    });
+    for (const ids of Object.values(byGroup)) {
+      for (let i = 1; i < ids.length; i++) {
+        edgesData.push({from: ids[0], to: ids[i], color:{color:'#30363d',opacity:0.5}, width:1, dashes:true});
+      }
+    }
+  }
+
+  const container = document.getElementById('topoCanvas');
+  if (_topoNetwork) { _topoNetwork.destroy(); _topoNetwork = null; }
+  _topoNodes = new vis.DataSet(nodesData);
+  _topoEdges = new vis.DataSet(edgesData);
+  _topoNetwork = new vis.Network(container, {nodes: _topoNodes, edges: _topoEdges}, {
+    nodes: { shape: 'dot', size: 14, borderWidth: 2 },
+    edges: { smooth: false },
+    physics: { solver: 'forceAtlas2Based', stabilization: { iterations: 150 } },
+    interaction: { hover: true, tooltipDelay: 300 },
+    layout: {},
+  });
+  _topoNetwork.on('click', params => {
+    if (!params.nodes.length) return;
+    const node = _topoNodes.get(params.nodes[0]);
+    showTopoSidebar(node.row);
+  });
+
+  // Legend
+  renderTopoLegend(colorBy, source);
+}
+
+function renderTopoLegend(colorBy, source) {
+  const leg = document.getElementById('topoLegend');
+  const entries = {};
+  source.forEach(row => {
+    const col = _nodeColor(row, colorBy);
+    let label;
+    if (colorBy === 'urgency')  label = row['Urgency Level'] || 'Unknown';
+    else if (colorBy === 'eox') {
+      const v = (row['EOX Compliance']||'').toLowerCase();
+      label = v.includes('noncompliant')||v.includes('non-compliant') ? 'Non-Compliant'
+            : v.includes('warning') ? 'Warning' : v.includes('compliant') ? 'Compliant' : 'Unknown';
+    }
+    else if (colorBy === 'coverage') label = (row['Coverage Status']||'Unknown').trim();
+    else if (colorBy === 'tag') {
+      const did = _rowDeviceId(row);
+      const tags = _deviceTags[did]||[];
+      label = tags[0] || 'Untagged';
+    }
+    else label = '';
+    if (label) entries[label] = col;
+  });
+  leg.innerHTML = Object.entries(entries).map(([l,c]) =>
+    `<span style="display:inline-flex;align-items:center;gap:0.3rem"><span style="width:10px;height:10px;border-radius:50%;background:${c};display:inline-block"></span><span style="color:#8b949e">${l}</span></span>`
+  ).join('');
+}
+
+function topoFitView()    { if (_topoNetwork) _topoNetwork.fit(); }
+function topoReLayout()   { if (_topoNetwork) { _topoNetwork.setOptions({physics:{enabled:true}}); setTimeout(()=>_topoNetwork.setOptions({physics:{enabled:false}}),2000); } }
+
+function showTopoSidebar(row) {
+  const pid = unifiedPidCol ? (row[unifiedPidCol]||'') : '';
+  const sn  = unifiedSnCol  ? (row[unifiedSnCol] ||'') : '';
+  const did = _rowDeviceId(row);
+  const tags = (_deviceTags[did]||[]);
+
+  const complianceFields = [
+    'EOX Compliance','SWIM Compliance','PSIRT Compliance','Bug Compliance','Coverage Status','Urgency Level','Urgency Score'
+  ];
+  const rows = complianceFields
+    .filter(h => row[h] !== undefined && row[h] !== '')
+    .map(h => {
+      const v = String(row[h]||'');
+      return `<tr><td style="color:#8b949e;padding:0.2rem 0.4rem 0.2rem 0;white-space:nowrap">${h}</td>
+              <td style="padding:0.2rem 0;font-weight:600">${v||'—'}</td></tr>`;
+    }).join('');
+
+  document.getElementById('topoSidebarTitle').textContent = pid || sn || 'Unknown';
+  document.getElementById('topoSidebarContent').innerHTML =
+    `<table style="border-collapse:collapse;width:100%;font-size:0.78rem">${rows}</table>` +
+    (tags.length ? `<div style="margin-top:0.75rem;font-size:0.75rem;color:#6e7681">Tags: ${tags.map(t=>`<span class="tag-pill">${t}</span>`).join(' ')}</div>` : '');
+  document.getElementById('topoSidebar').style.display = 'block';
 }
 
 async function loadDashboard() {
