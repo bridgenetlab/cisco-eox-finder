@@ -1232,6 +1232,7 @@ thead th.tag-col { color: #79c0ff; }
   <div id="unifiedDownloadBar" style="max-width:1200px;margin:0 auto 1rem;display:none">
     <a id="unifiedDownloadLink" class="btn-green" href="#">⬇ Download Unified Report</a>
     <a id="unifiedDownloadHtmlLink" class="btn-secondary" href="#" target="_blank" style="margin-left:0.5rem">⎙ HTML Report</a>
+    <a id="unifiedDownloadPdfLink" class="btn-secondary" href="#" target="_blank" style="margin-left:0.5rem;border-color:#f0883e;color:#f0883e">⎙ PDF (Print)</a>
     <button class="btn-secondary" onclick="saveCurrentList('unified')" style="margin-left:0.5rem">💾 Save List</button>
     <span style="font-size:0.8rem;color:#6e7681;margin-left:0.75rem">Includes all original columns + EOX · Coverage · SWIM · PSIRT · Bug data</span>
   </div>
@@ -2924,6 +2925,7 @@ async function doUnifiedUpload(extraFields = {}) {
 
     document.getElementById('unifiedDownloadLink').href     = `/unified/download/${data.job_id}`;
     document.getElementById('unifiedDownloadHtmlLink').href = `/unified/html/${data.job_id}`;
+    document.getElementById('unifiedDownloadPdfLink').href  = `/unified/pdf/${data.job_id}`;
     document.getElementById('unifiedDownloadBar').style.display = 'block';
 
   } catch(err) {
@@ -4477,7 +4479,24 @@ def unified_html(job_id: str):
     return _generate_html_report(df, "Unified Compliance Report"), 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
-def _generate_html_report(df: pd.DataFrame, title: str) -> str:
+@app.route("/unified/pdf/<job_id>")
+def unified_pdf(job_id: str):
+    """Open the HTML report with auto-print triggered — browser prints/saves as PDF."""
+    df = _load_job(job_id)
+    if df is None:
+        return "Job not found or expired", 404
+    return _generate_html_report(df, "Unified Compliance Report", print_on_load=True), 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+@app.route("/eox/pdf/<job_id>")
+def eox_pdf(job_id: str):
+    df = _load_job(job_id)
+    if df is None:
+        return "Job not found or expired", 404
+    return _generate_html_report(df, "EOX Compliance Report", print_on_load=True), 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+def _generate_html_report(df: pd.DataFrame, title: str, print_on_load: bool = False) -> str:
     """Generate a self-contained, printable HTML compliance report from a job DataFrame."""
     COMPLIANCE_COLS = {
         "EOX Compliance", "SWIM Compliance", "PSIRT Compliance", "Coverage Status", "Bug Compliance"
@@ -4528,8 +4547,15 @@ def _generate_html_report(df: pd.DataFrame, title: str) -> str:
   td   {{ padding:0.38rem 0.6rem; border-bottom:1px solid #21262d; vertical-align:top; }}
   tr:hover td {{ background:#161b22; }}
   @media print {{
-    body {{ background:white; color:black; }}
+    body {{ background:white; color:#111; padding:0.5rem; font-size:0.7rem; }}
+    h1   {{ font-size:1rem; color:#111; }}
+    .meta{{ color:#555; }}
+    th   {{ background:#eee; color:#111; border-bottom:2px solid #aaa; }}
+    td   {{ border-bottom:1px solid #ddd; color:#111; }}
     tr:hover td {{ background:transparent; }}
+    table{{ page-break-inside:auto; }}
+    tr   {{ page-break-inside:avoid; page-break-after:auto; }}
+    thead{{ display:table-header-group; }}
   }}
 </style>
 </head>
@@ -4540,6 +4566,7 @@ def _generate_html_report(df: pd.DataFrame, title: str) -> str:
 <thead><tr>{thead}</tr></thead>
 <tbody>{rows_html}</tbody>
 </table>
+{"<script>window.onload=function(){window.print()}</script>" if print_on_load else ""}
 </body>
 </html>"""
 
