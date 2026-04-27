@@ -1338,6 +1338,11 @@ thead th.urgency-col { color: #f0883e; }
         <h3 style="font-size:0.9rem;color:#8b949e;margin-bottom:0.75rem">Jobs Over Time (rows processed per upload)</h3>
         <canvas id="dashTrendBar" height="120"></canvas>
       </div>
+      <div style="margin-bottom:2rem">
+        <h3 style="font-size:0.9rem;color:#8b949e;margin-bottom:0.75rem">Non-Compliant Trend (per job, last 90 days)</h3>
+        <p style="font-size:0.78rem;color:#6e7681;margin:0 0 0.75rem">Each point = one bulk job. Shows how many non-compliant devices were found at that moment in time.</p>
+        <canvas id="dashNcTrend" height="140"></canvas>
+      </div>
       <div id="dashJobTable" style="overflow-x:auto"></div>
     </div>
   </div>
@@ -3028,6 +3033,42 @@ function renderDashboard(jobs) {
         y: { ticks: { color: '#6e7681' }, grid: { color: '#21262d' }, beginAtZero: true }
       },
       plugins: { legend: { display: false } }
+    }
+  });
+
+  // Non-compliant trend line chart
+  const NC_TYPES   = ['eox', 'psirt', 'bug', 'unified'];
+  const NC_COLORS  = { eox: '#58a6ff', psirt: '#f85149', bug: '#a371f7', unified: '#3fb950' };
+  const NC_NC_KEY  = { eox: 'non_compliant', psirt: 'psirt_non_compliant', bug: 'bug_non_compliant', unified: 'non_compliant' };
+  const ncJobs     = [...jobs].reverse().filter(j => NC_TYPES.includes(j.job_type));
+  const ncLabels   = ncJobs.map(j => new Date(j.created_at * 1000).toLocaleDateString());
+  const ncDatasets = NC_TYPES.map(type => {
+    const color = NC_COLORS[type];
+    const key   = NC_NC_KEY[type];
+    return {
+      label:           type.toUpperCase(),
+      data:            ncJobs.map(j => j.job_type === type ? (j.stats[key] || j.stats.noncompliant || 0) : null),
+      borderColor:     color,
+      backgroundColor: color + '33',
+      pointRadius:     4,
+      spanGaps:        false,
+      tension:         0.3,
+      fill:            false,
+    };
+  }).filter((_, i) => ncJobs.some(j => j.job_type === NC_TYPES[i]));
+
+  rebuildChart('dashNcTrend', {
+    type: 'line',
+    data: { labels: ncLabels, datasets: ncDatasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: {
+        x: { ticks: { color: '#6e7681', maxRotation: 45, font: { size: 10 } }, grid: { color: '#21262d' } },
+        y: { ticks: { color: '#6e7681' }, grid: { color: '#21262d' }, beginAtZero: true,
+             title: { display: true, text: 'Non-Compliant Devices', color: '#6e7681' } }
+      },
+      plugins: { legend: { labels: { color: '#8b949e', boxWidth: 12 } },
+                 tooltip: { callbacks: { label: ctx => `${ctx.dataset.label}: ${ctx.parsed.y} non-compliant` } } }
     }
   });
 
