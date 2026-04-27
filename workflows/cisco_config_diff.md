@@ -79,6 +79,20 @@ python cisco_config_diff.py --reference startup.cfg --current running.cfg --no-c
 
 **Load Sample** buttons pre-load a realistic example showing an ACL weakening and IP change.
 
+### Web App — Bulk ZIP Upload
+
+1. In the same **Config Diff** tab, scroll to the **Bulk Config Diff** card
+2. Drop or browse a `.zip` file containing multiple config files (`.cfg`, `.txt`, `.conf`, `.log`; max 50 files)
+3. Baseline auto-detection: any file named `baseline.cfg`, `baseline.txt`, `reference.cfg`, or `reference.conf` is used automatically
+4. If no baseline is found, a dropdown appears — select the baseline file and click **Analyze**
+5. Results appear sorted by risk score (highest first):
+   - Summary pills: total files / Critical / High / Medium / Low
+   - Table: Device, Filename, Risk Score, Risk Level badge, per-level change counts, Total Changes
+   - **⎙ HTML** button on each row downloads a self-contained per-device diff report
+6. Click **⬇ Download Excel Summary** to export the summary table
+
+**API endpoint:** `POST /config-diff/bulk` — form-data with `zip_file` (required) and `baseline` (optional filename override)
+
 ---
 
 ## Output Fields (per changed line)

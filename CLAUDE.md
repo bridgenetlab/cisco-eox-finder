@@ -451,6 +451,8 @@ Imports `cisco_eox`, `cisco_swim`, `cisco_psirt`, `cisco_sn2info`, and `cisco_bu
 | `/bug/download/<job_id>` | GET | Stream Bug-enriched Excel for download |
 | `/bug/html/<job_id>` | GET | HTML report for a Bug job |
 | `/config-diff/analyze` | POST | Accept two config text blocks, return risk-annotated diff |
+| `/config-diff/bulk` | POST | Accept `.zip` of config files + optional `baseline` field; diff each file vs baseline |
+| `/config-diff/bulk-download/<job_id>` | GET | Stream bulk diff Excel summary for download |
 | `/unified/upload` | POST | Accept `.xlsx`/`.csv`, enrich with EOX + Coverage + SWIM + PSIRT + Bug data |
 | `/unified/download/<job_id>` | GET | Stream unified report Excel for download |
 

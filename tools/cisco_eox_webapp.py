@@ -16,6 +16,7 @@ import sqlite3
 import sys
 import time
 import uuid
+import zipfile
 from pathlib import Path
 
 import pandas as pd
@@ -1088,6 +1089,63 @@ thead th.urgency-col { color: #f0883e; }
         <thead id="diffThead"></thead>
         <tbody id="diffTbody"></tbody>
       </table>
+    </div>
+  </div>
+
+  <!-- ── Bulk Config Diff second card ── -->
+  <div style="max-width:1200px;margin:0 auto 1.5rem">
+    <div class="card">
+      <h3 style="margin-top:0">Bulk Config Diff — ZIP Upload</h3>
+      <p style="font-size:0.85rem;color:#8b949e;margin:0 0 1rem">
+        Upload a <strong>.zip</strong> containing multiple config files. One file is the baseline; all others are diffed against it. Files named <code>baseline.cfg</code> or <code>reference.cfg</code> are auto-detected.
+      </p>
+
+      <div class="drop-zone" id="bulkDiffDropZone" ondragover="event.preventDefault()" ondrop="bulkDiffOnDrop(event)">
+        Drop a <strong>.zip</strong> file here or
+        <label style="cursor:pointer;color:#58a6ff;text-decoration:underline">click to browse
+          <input type="file" id="bulkDiffZipInput" accept=".zip" style="display:none">
+        </label>
+      </div>
+
+      <div id="bulkDiffBaselineWrap" style="display:none;margin-top:0.75rem;padding:0.75rem;background:#161b22;border-radius:6px;border:1px solid #30363d">
+        <label style="font-weight:600">No baseline auto-detected — select the baseline file:</label>
+        <div style="display:flex;gap:0.5rem;align-items:center;margin-top:0.5rem">
+          <select id="bulkDiffBaselineSel" style="flex:1;padding:0.4rem 0.75rem"></select>
+          <button class="btn-primary" onclick="resubmitBulkDiff()">Analyze</button>
+        </div>
+      </div>
+
+      <div style="margin-top:0.75rem">
+        <span id="bulkDiffStatus" class="status-msg"></span>
+        <div id="bulkDiffProgressWrap" style="display:none;margin-top:0.5rem">
+          <div class="progress-bar"><div class="progress-fill" style="width:60%"></div></div>
+          <span style="font-size:0.8rem;color:#8b949e">Analyzing configs…</span>
+        </div>
+      </div>
+
+      <div id="bulkDiffSummaryBar" class="summary-bar" style="display:none"></div>
+
+      <div id="bulkDiffDownloadBar" style="display:none;margin-top:0.75rem">
+        <a id="bulkDiffDownloadLink" class="btn-secondary" href="#">⬇ Download Excel Summary</a>
+      </div>
+
+      <div id="bulkDiffTableWrap" class="table-wrap" style="display:none">
+        <table style="width:100%;border-collapse:collapse;font-size:0.78rem">
+          <thead><tr style="background:#161b22">
+            <th style="text-align:left;padding:0.5rem 0.75rem;border-bottom:1px solid #30363d">Device</th>
+            <th style="text-align:left;padding:0.5rem 0.75rem;border-bottom:1px solid #30363d">Filename</th>
+            <th style="text-align:right;padding:0.5rem 0.75rem;border-bottom:1px solid #30363d">Score</th>
+            <th style="text-align:left;padding:0.5rem 0.75rem;border-bottom:1px solid #30363d">Level</th>
+            <th style="text-align:right;padding:0.5rem 0.75rem;border-bottom:1px solid #30363d;color:#f85149">Crit</th>
+            <th style="text-align:right;padding:0.5rem 0.75rem;border-bottom:1px solid #30363d;color:#d29922">High</th>
+            <th style="text-align:right;padding:0.5rem 0.75rem;border-bottom:1px solid #30363d;color:#388bfd">Med</th>
+            <th style="text-align:right;padding:0.5rem 0.75rem;border-bottom:1px solid #30363d;color:#3fb950">Low</th>
+            <th style="text-align:right;padding:0.5rem 0.75rem;border-bottom:1px solid #30363d">Changes</th>
+            <th style="padding:0.5rem 0.75rem;border-bottom:1px solid #30363d">Report</th>
+          </tr></thead>
+          <tbody id="bulkDiffTbody"></tbody>
+        </table>
+      </div>
     </div>
   </div>
 </div>
@@ -3026,6 +3084,179 @@ td{padding:0.3rem 0.5rem;vertical-align:top}</style></head><body>
   a.download = 'cisco_config_diff_report.html';
   a.click();
 }
+
+// ── Bulk Config Diff ──────────────────────────────────────────────────────────
+let _bulkDiffZipFile = null;
+let _bulkDiffFiles   = [];
+
+(function() {
+  const inp = document.getElementById('bulkDiffZipInput');
+  inp.addEventListener('change', () => {
+    if (inp.files[0]) { _bulkDiffZipFile = inp.files[0]; doBulkDiffUpload(''); }
+  });
+  const dz = document.getElementById('bulkDiffDropZone');
+  dz.addEventListener('dragover', e => { e.preventDefault(); dz.style.borderColor = '#58a6ff'; });
+  dz.addEventListener('dragleave', () => { dz.style.borderColor = ''; });
+  dz.addEventListener('drop', e => {
+    e.preventDefault(); dz.style.borderColor = '';
+    const f = e.dataTransfer.files[0];
+    if (f) { _bulkDiffZipFile = f; doBulkDiffUpload(''); }
+  });
+})();
+
+function bulkDiffOnDrop(e) { e.preventDefault(); }
+
+async function doBulkDiffUpload(baseline) {
+  if (!_bulkDiffZipFile) return;
+  const status   = document.getElementById('bulkDiffStatus');
+  const progress = document.getElementById('bulkDiffProgressWrap');
+  const baseline_wrap = document.getElementById('bulkDiffBaselineWrap');
+  status.textContent = '';
+  baseline_wrap.style.display = 'none';
+  document.getElementById('bulkDiffSummaryBar').style.display    = 'none';
+  document.getElementById('bulkDiffDownloadBar').style.display   = 'none';
+  document.getElementById('bulkDiffTableWrap').style.display     = 'none';
+  progress.style.display = 'block';
+
+  try {
+    const fd = new FormData();
+    fd.append('zip_file', _bulkDiffZipFile);
+    if (baseline) fd.append('baseline', baseline);
+
+    const resp = await fetch('/config-diff/bulk', { method: 'POST', body: fd });
+    const data = await resp.json();
+    progress.style.display = 'none';
+
+    if (data.error) { status.textContent = 'Error: ' + data.error; return; }
+
+    if (data.needs_baseline) {
+      const sel = document.getElementById('bulkDiffBaselineSel');
+      sel.innerHTML = data.files.map(f => `<option value="${f}">${f}</option>`).join('');
+      baseline_wrap.style.display = 'block';
+      status.textContent = `${data.files.length} config files found — select which one is the baseline.`;
+      return;
+    }
+
+    _bulkDiffFiles = data.files;
+    renderBulkDiffSummary(data.stats, data.baseline);
+    renderBulkDiffTable(data.files);
+    document.getElementById('bulkDiffDownloadLink').href = `/config-diff/bulk-download/${data.job_id}`;
+    document.getElementById('bulkDiffDownloadBar').style.display = 'block';
+    status.textContent = '';
+
+  } catch(err) {
+    progress.style.display = 'none';
+    status.textContent = 'Error: ' + err.message;
+  }
+}
+
+function resubmitBulkDiff() {
+  const baseline = document.getElementById('bulkDiffBaselineSel').value;
+  if (!baseline) return;
+  doBulkDiffUpload(baseline);
+}
+
+function renderBulkDiffSummary(s, baseline) {
+  const bar = document.getElementById('bulkDiffSummaryBar');
+  bar.style.display = 'flex';
+  bar.innerHTML = `
+    <span class="pill pill-total">${s.total} Files vs <code style="font-size:0.7rem">${baseline}</code></span>
+    <span class="pill" style="background:#f8514922;color:#f85149">${s.critical} Critical</span>
+    <span class="pill" style="background:#d2992222;color:#d29922">${s.high} High</span>
+    <span class="pill" style="background:#388bfd22;color:#388bfd">${s.medium} Medium</span>
+    <span class="pill pill-c">${s.low} Low</span>`;
+}
+
+function renderBulkDiffTable(files) {
+  const tbody = document.getElementById('bulkDiffTbody');
+  tbody.innerHTML = files.map((f, i) => {
+    const sm = f.summary;
+    const lvlBadge = urgencyBadge(f.risk_level);
+    return `<tr style="border-bottom:1px solid #21262d">
+      <td style="padding:0.4rem 0.75rem;font-weight:600">${f.device}</td>
+      <td style="padding:0.4rem 0.75rem;color:#6e7681;font-size:0.75rem;font-family:monospace">${f.name}</td>
+      <td style="padding:0.4rem 0.75rem;text-align:right;font-family:monospace;font-weight:700">${f.risk_score}</td>
+      <td style="padding:0.4rem 0.75rem">${lvlBadge}</td>
+      <td style="padding:0.4rem 0.75rem;text-align:right;color:#f85149">${sm.critical||0}</td>
+      <td style="padding:0.4rem 0.75rem;text-align:right;color:#d29922">${sm.high||0}</td>
+      <td style="padding:0.4rem 0.75rem;text-align:right;color:#388bfd">${sm.medium||0}</td>
+      <td style="padding:0.4rem 0.75rem;text-align:right;color:#3fb950">${sm.low||0}</td>
+      <td style="padding:0.4rem 0.75rem;text-align:right;color:#8b949e">${sm.total_changes||0}</td>
+      <td style="padding:0.4rem 0.75rem">
+        <button class="btn-secondary" style="font-size:0.75rem;padding:0.2rem 0.5rem"
+          onclick="downloadBulkDiffReport(${i})">⎙ HTML</button>
+      </td>
+    </tr>`;
+  }).join('');
+  document.getElementById('bulkDiffTableWrap').style.display = 'block';
+}
+
+function downloadBulkDiffReport(idx) {
+  const f = _bulkDiffFiles[idx];
+  if (!f) return;
+  const s = f.summary;
+  const score = f.risk_score;
+
+  const riskColor = {critical:'#f85149',high:'#e37300',medium:'#e3b341',low:'#58a6ff',info:'#6e7681'};
+  const rowBg = c => {
+    if (c.action === 'separator') return '#0d1117';
+    if (c.risk_level === 'critical') return 'rgba(248,81,73,0.12)';
+    if (c.risk_level === 'high')     return 'rgba(227,130,0,0.10)';
+    if (c.risk_level === 'medium')   return 'rgba(227,179,65,0.08)';
+    if (c.risk_level === 'low')      return 'rgba(88,166,255,0.06)';
+    return c.action === 'add' ? 'rgba(63,185,80,0.04)' : c.action === 'remove' ? 'rgba(248,81,73,0.04)' : 'transparent';
+  };
+
+  let tableRows = '';
+  for (const c of f.changes) {
+    const bg = rowBg(c);
+    const prefix = c.action==='add'?'+':c.action==='remove'?'−':' ';
+    const col = c.action==='add'?'#3fb950':c.action==='remove'?'#f85149':'#484f58';
+    const content = (c.content||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const rc = riskColor[c.risk_level] || '#6e7681';
+    const badge = c.risk_reason ? `<span style="background:${rc}22;color:${rc};padding:0.1rem 0.4rem;border-radius:3px;font-size:0.65rem;font-weight:700;margin-left:0.5rem">${(c.risk_level||'').toUpperCase()}</span><span style="color:#8b949e;font-size:0.7rem;margin-left:0.5rem;font-style:italic">${c.risk_reason}</span>` : '';
+    if (c.action === 'separator') {
+      tableRows += `<tr><td colspan="5" style="padding:0.25rem;text-align:center;color:#484f58;font-style:italic;font-size:0.72rem">${content}</td></tr>`;
+    } else {
+      tableRows += `<tr style="background:${bg};border-bottom:1px solid #1c2128">
+        <td style="padding:0.25rem 0.5rem;color:#484f58;font-family:monospace;font-size:0.68rem;text-align:right">${c.ref_line_no||''}</td>
+        <td style="padding:0.25rem 0.5rem;color:#484f58;font-family:monospace;font-size:0.68rem;text-align:right">${c.cur_line_no||''}</td>
+        <td style="padding:0.25rem 0.5rem;font-family:monospace;font-weight:700;color:${col}">${prefix}</td>
+        <td style="padding:0.25rem 0.5rem;font-family:monospace;font-size:0.75rem;white-space:pre-wrap;word-break:break-all">${content}</td>
+        <td style="padding:0.25rem 0.5rem;white-space:nowrap">${badge}</td>
+      </tr>`;
+    }
+  }
+
+  const now = new Date().toISOString().replace('T',' ').slice(0,19) + ' UTC';
+  const scoreLabel = score >= 20 ? 'CRITICAL' : score >= 10 ? 'HIGH' : score >= 3 ? 'MEDIUM' : 'LOW';
+  const scoreCol   = score >= 20 ? '#f85149' : score >= 10 ? '#e37300' : score >= 3 ? '#e3b341' : '#3fb950';
+
+  const html = `<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>Config Diff — ${f.device}</title>
+<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d1117;color:#c9d1d9;margin:0;padding:1.5rem;font-size:0.82rem}
+h1{color:#e6edf3;font-size:1.2rem;margin-bottom:0.25rem}.meta{color:#6e7681;font-size:0.75rem;margin-bottom:1rem}
+.pills{display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:1.5rem}.pill{padding:0.3rem 0.75rem;border-radius:20px;font-size:0.78rem;font-weight:700}
+table{border-collapse:collapse;width:100%;font-size:0.78rem}th{background:#161b22;color:#8b949e;padding:0.4rem 0.6rem;text-align:left;border-bottom:2px solid #30363d}
+td{padding:0.3rem 0.5rem;vertical-align:top}</style></head><body>
+<h1>Cisco Config Diff — ${f.device}</h1>
+<p class="meta">Generated ${now} · ${f.name} · +${s.lines_added} added / −${s.lines_removed} removed · ${s.total_changes} total changes</p>
+<div class="pills">
+  <span class="pill" style="background:${scoreCol}22;color:${scoreCol};border:1px solid ${scoreCol}55">Risk Score: ${score} (${scoreLabel})</span>
+  ${s.critical?`<span class="pill" style="background:#f8514922;color:#f85149;border:1px solid #f8514955">${s.critical} Critical</span>`:''}
+  ${s.high?`<span class="pill" style="background:#e3730022;color:#e37300;border:1px solid #e3730055">${s.high} High</span>`:''}
+  ${s.medium?`<span class="pill" style="background:#e3b34122;color:#e3b341;border:1px solid #e3b34155">${s.medium} Medium</span>`:''}
+  ${s.low?`<span class="pill" style="background:#58a6ff22;color:#58a6ff;border:1px solid #58a6ff55">${s.low} Low</span>`:''}
+</div>
+<table><thead><tr><th>Ref#</th><th>Cur#</th><th></th><th>Config Line</th><th>Risk</th></tr></thead>
+<tbody>${tableRows}</tbody></table></body></html>`;
+
+  const blob = new Blob([html], {type:'text/html'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `cisco_diff_${f.device}.html`;
+  a.click();
+}
 </script>
 </body>
 </html>
@@ -3635,6 +3866,118 @@ def config_diff_analyze():
         or cisco_config_diff.RISK_ORDER.get(c["risk_level"], 0) >= min_rank
     ]
     return jsonify(result)
+
+
+_BULK_DIFF_EXTS     = {'.cfg', '.txt', '.conf', '.log'}
+_BULK_DIFF_BASELINE = {'baseline.cfg', 'baseline.txt', 'baseline.conf',
+                       'reference.cfg', 'reference.txt', 'reference.conf'}
+_BULK_DIFF_MAX      = 50
+
+
+@app.route("/config-diff/bulk", methods=["POST"])
+def config_diff_bulk():
+    if "zip_file" not in request.files:
+        return jsonify({"error": "No ZIP file provided"}), 400
+    zf = request.files["zip_file"]
+    baseline_name = request.form.get("baseline", "").strip()
+
+    try:
+        zip_bytes = zf.read()
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+            config_names = [
+                n for n in z.namelist()
+                if not n.endswith('/')
+                and os.path.splitext(n.lower())[1] in _BULK_DIFF_EXTS
+            ]
+    except zipfile.BadZipFile:
+        return jsonify({"error": "Invalid or corrupt ZIP file"}), 400
+
+    if not config_names:
+        return jsonify({"error": "No config files (.cfg, .txt, .conf, .log) found in ZIP"}), 400
+    if len(config_names) > _BULK_DIFF_MAX:
+        return jsonify({"error": f"ZIP contains more than {_BULK_DIFF_MAX} config files"}), 400
+
+    if not baseline_name:
+        for name in config_names:
+            if os.path.basename(name).lower() in _BULK_DIFF_BASELINE:
+                baseline_name = name
+                break
+
+    if not baseline_name or baseline_name not in config_names:
+        return jsonify({"needs_baseline": True, "files": config_names})
+
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+        ref_text  = z.read(baseline_name).decode('utf-8', errors='replace')
+        ref_lines = ref_text.splitlines(keepends=True)
+        per_file  = []
+        for name in config_names:
+            if name == baseline_name:
+                continue
+            cur_text  = z.read(name).decode('utf-8', errors='replace')
+            cur_lines = cur_text.splitlines(keepends=True)
+            result    = cisco_config_diff.analyze_diff(ref_lines, cur_lines)
+            score     = result["risk_score"]
+            level     = ("Critical" if score >= 20 else "High" if score >= 10
+                         else "Medium" if score >= 3 else "Low")
+            per_file.append({
+                "name":       name,
+                "device":     os.path.splitext(os.path.basename(name))[0],
+                "risk_score": score,
+                "risk_level": level,
+                "summary":    result["summary"],
+                "changes":    result["changes"],
+            })
+
+    per_file.sort(key=lambda x: x["risk_score"], reverse=True)
+
+    rows = [{
+        "Device":        f["device"],
+        "Filename":      f["name"],
+        "Risk Score":    f["risk_score"],
+        "Risk Level":    f["risk_level"],
+        "Critical":      f["summary"].get("critical", 0),
+        "High":          f["summary"].get("high", 0),
+        "Medium":        f["summary"].get("medium", 0),
+        "Low":           f["summary"].get("low", 0),
+        "Total Changes": f["summary"].get("total_changes", 0),
+        "Lines Added":   f["summary"].get("lines_added", 0),
+        "Lines Removed": f["summary"].get("lines_removed", 0),
+    } for f in per_file]
+    df = pd.DataFrame(rows) if rows else pd.DataFrame(
+        columns=["Device", "Filename", "Risk Score", "Risk Level",
+                 "Critical", "High", "Medium", "Low",
+                 "Total Changes", "Lines Added", "Lines Removed"])
+
+    stats = {
+        "total":    len(per_file),
+        "critical": sum(1 for f in per_file if f["risk_level"] == "Critical"),
+        "high":     sum(1 for f in per_file if f["risk_level"] == "High"),
+        "medium":   sum(1 for f in per_file if f["risk_level"] == "Medium"),
+        "low":      sum(1 for f in per_file if f["risk_level"] == "Low"),
+        "baseline": baseline_name,
+    }
+    job_id = str(uuid.uuid4())[:8]
+    _store_job(job_id, df)
+    _record_job_meta(job_id, "configdiff", stats)
+
+    return jsonify({"job_id": job_id, "baseline": baseline_name,
+                    "files": per_file, "stats": stats})
+
+
+@app.route("/config-diff/bulk-download/<job_id>")
+def config_diff_bulk_download(job_id: str):
+    df = _load_job(job_id)
+    if df is None:
+        return "Job not found or expired", 404
+    buf = io.BytesIO()
+    df.to_excel(buf, index=False, engine="openpyxl")
+    buf.seek(0)
+    return send_file(
+        buf,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        download_name="cisco_bulk_config_diff.xlsx",
+        as_attachment=True,
+    )
 
 
 @app.route("/unified/upload", methods=["POST"])
