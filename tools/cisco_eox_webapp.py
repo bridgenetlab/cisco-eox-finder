@@ -68,6 +68,10 @@ def _db():
         "(baseline_id TEXT PRIMARY KEY, name TEXT NOT NULL, "
         "content TEXT NOT NULL, created_at INTEGER NOT NULL)"
     )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS device_tags "
+        "(device_id TEXT PRIMARY KEY, tags TEXT NOT NULL DEFAULT '[]')"
+    )
     conn.commit()
     return conn
 
@@ -162,6 +166,49 @@ def _delete_baseline(bid: str) -> bool:
     with _db() as conn:
         cur = conn.execute("DELETE FROM config_baselines WHERE baseline_id = ?", (bid,))
     return cur.rowcount > 0
+
+
+# ── Device tags ───────────────────────────────────────────────────────────────
+import json as _json
+
+
+def _get_device_tags(device_id: str) -> list[str]:
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT tags FROM device_tags WHERE device_id = ?", (device_id,)
+        ).fetchone()
+    return _json.loads(row[0]) if row else []
+
+
+def _set_device_tags(device_id: str, tags: list[str]) -> list[str]:
+    tags = [t.strip() for t in tags if t.strip()]
+    with _db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO device_tags (device_id, tags) VALUES (?, ?)",
+            (device_id, _json.dumps(tags)),
+        )
+    return tags
+
+
+def _batch_get_device_tags(device_ids: list[str]) -> dict[str, list[str]]:
+    if not device_ids:
+        return {}
+    placeholders = ",".join("?" for _ in device_ids)
+    with _db() as conn:
+        rows = conn.execute(
+            f"SELECT device_id, tags FROM device_tags WHERE device_id IN ({placeholders})",
+            device_ids,
+        ).fetchall()
+    result = {did: [] for did in device_ids}
+    for did, tags_json in rows:
+        result[did] = _json.loads(tags_json)
+    return result
+
+
+def _list_all_device_tags() -> dict[str, list[str]]:
+    with _db() as conn:
+        rows = conn.execute("SELECT device_id, tags FROM device_tags").fetchall()
+    return {did: _json.loads(t) for did, t in rows}
 
 
 # ── Webhook alerts ───────────────────────────────────────────────────────────
@@ -700,6 +747,20 @@ thead th.psirt-col { color: #f85149; }
 thead th.bug-col     { color: #a371f7; }
 thead th.urgency-col { color: #f0883e; }
 
+thead th.tag-col { color: #79c0ff; }
+.tag-pill { display:inline-flex;align-items:center;gap:0.2rem;background:#79c0ff22;color:#79c0ff;
+  border:1px solid #79c0ff44;border-radius:10px;padding:0.05rem 0.45rem;font-size:0.65rem;
+  font-weight:600;margin:0.1rem;cursor:default;white-space:nowrap }
+.tag-cell { cursor:pointer;min-width:90px }
+.tag-cell:hover { background:rgba(121,192,255,0.06) }
+.tag-add-btn { background:none;border:1px dashed #30363d;color:#6e7681;border-radius:10px;
+  padding:0.05rem 0.45rem;font-size:0.65rem;cursor:pointer;margin:0.1rem }
+.tag-add-btn:hover { border-color:#79c0ff;color:#79c0ff }
+#tagModal { display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1000;
+  align-items:center;justify-content:center }
+#tagModalBox { background:#161b22;border:1px solid #30363d;border-radius:8px;
+  padding:1.25rem;min-width:320px;max-width:480px;width:100% }
+
 /* Config Diff risk colours */
 .diff-add     { background: rgba(63,185,80,0.06); }
 .diff-remove  { background: rgba(248,81,73,0.06); }
@@ -1174,9 +1235,35 @@ thead th.urgency-col { color: #f0883e; }
     <button class="btn-secondary" onclick="saveCurrentList('unified')" style="margin-left:0.5rem">💾 Save List</button>
     <span style="font-size:0.8rem;color:#6e7681;margin-left:0.75rem">Includes all original columns + EOX · Coverage · SWIM · PSIRT · Bug data</span>
   </div>
+  <div id="unifiedTagFilterBar" style="max-width:1200px;margin:0 auto 0.5rem;display:none;align-items:center;gap:0.5rem;flex-wrap:wrap">
+    <span style="font-size:0.8rem;color:#79c0ff">🏷 Filter by tag:</span>
+    <input id="tagFilterInput" type="text" placeholder="type a tag…" oninput="applyTagFilter()"
+      style="background:#161b22;border:1px solid #30363d;border-radius:4px;color:#c9d1d9;padding:0.25rem 0.6rem;font-size:0.8rem;width:160px">
+    <span id="tagFilterPills" style="display:flex;gap:0.3rem;flex-wrap:wrap"></span>
+    <button onclick="clearTagFilter()" id="tagFilterClear" style="display:none;background:none;border:1px solid #30363d;color:#6e7681;border-radius:4px;padding:0.2rem 0.5rem;font-size:0.75rem;cursor:pointer">✕ Clear</button>
+    <span id="tagFilterCount" style="font-size:0.75rem;color:#6e7681"></span>
+  </div>
   <div id="unifiedTableWrap" class="table-wrap" style="display:none">
     <table id="unifiedTable"><thead id="unifiedThead"></thead><tbody id="unifiedTbody"></tbody></table>
     <div class="pagination" id="unifiedPagination"></div>
+  </div>
+</div>
+
+<!-- ── Tag Modal ── -->
+<div id="tagModal" onclick="if(event.target===this)closeTagModal()">
+  <div id="tagModalBox">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.75rem">
+      <span style="font-weight:700;color:#79c0ff">🏷 Tags for <span id="tagModalTitle"></span></span>
+      <button onclick="closeTagModal()" style="background:none;border:none;color:#6e7681;font-size:1.1rem;cursor:pointer">✕</button>
+    </div>
+    <div id="tagModalList" style="min-height:1.5rem;margin-bottom:0.75rem;display:flex;flex-wrap:wrap;gap:0.25rem"></div>
+    <div style="display:flex;gap:0.5rem">
+      <input id="tagNewInput" type="text" placeholder="New tag…" maxlength="40"
+        onkeydown="if(event.key==='Enter'){addDeviceTag();event.preventDefault()}"
+        style="flex:1;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#c9d1d9;padding:0.35rem 0.6rem;font-size:0.82rem">
+      <button onclick="addDeviceTag()" class="btn-primary" style="padding:0.35rem 0.75rem;font-size:0.82rem">Add</button>
+    </div>
+    <div id="tagModalError" style="font-size:0.75rem;color:#f85149;margin-top:0.4rem"></div>
   </div>
 </div>
 
@@ -2719,6 +2806,11 @@ let unifiedRows    = [];
 let unifiedHeaders = [];
 let unifiedColMeta = {};   // {eox:[...], cov:[...], swim:[...], psirt:[...], bug:[...]}
 let unifiedPage    = 1;
+let unifiedPidCol  = '';
+let unifiedSnCol   = '';
+let _deviceTags    = {};   // device_id -> [tags]
+let _tagFilter     = '';
+let _filteredRows  = [];
 
 const unifiedDropZone     = document.getElementById('unifiedDropZone');
 const unifiedFileInput    = document.getElementById('unifiedFileInput');
@@ -2754,8 +2846,10 @@ document.getElementById('unifiedClearUploadBtn').addEventListener('click', () =>
   document.getElementById('unifiedSummaryBar').style.display      = 'none';
   document.getElementById('unifiedDownloadBar').style.display     = 'none';
   document.getElementById('unifiedTableWrap').style.display       = 'none';
+  document.getElementById('unifiedTagFilterBar').style.display    = 'none';
   unifiedProgressWrap.style.display = 'none';
   unifiedRows = []; unifiedHeaders = []; unifiedColMeta = {};
+  _deviceTags = {}; _tagFilter = ''; _filteredRows = [];
 });
 
 function setUnifiedProgress(pct, msg) {
@@ -2813,9 +2907,20 @@ async function doUnifiedUpload(extraFields = {}) {
     unifiedHeaders = data.headers;
     unifiedColMeta = data.col_meta;
     unifiedPage    = 1;
+    unifiedPidCol  = data.pid_col || '';
+    unifiedSnCol   = data.sn_col  || '';
+    _deviceTags    = {};
+    _tagFilter     = '';
+    _filteredRows  = unifiedRows;
+    document.getElementById('tagFilterInput').value = '';
+    document.getElementById('tagFilterCount').textContent = '';
+    document.getElementById('tagFilterClear').style.display = 'none';
+    document.getElementById('tagFilterPills').innerHTML = '';
+    document.getElementById('unifiedTagFilterBar').style.display = 'flex';
 
     renderUnifiedSummary(data.stats);
     renderUnifiedTable();
+    fetchAllDeviceTags();
 
     document.getElementById('unifiedDownloadLink').href     = `/unified/download/${data.job_id}`;
     document.getElementById('unifiedDownloadHtmlLink').href = `/unified/html/${data.job_id}`;
@@ -2882,6 +2987,19 @@ function urgencyBadge(level) {
   return `<span class="badge-sm badge-sm-uk">${level}</span>`;
 }
 
+function _rowDeviceId(row) {
+  const pid = unifiedPidCol ? (row[unifiedPidCol] || '').toString().trim().toUpperCase() : '';
+  const sn  = unifiedSnCol  ? (row[unifiedSnCol]  || '').toString().trim().toUpperCase() : '';
+  return pid || sn || '';
+}
+
+function _tagCellHtml(did) {
+  const tags = _deviceTags[did] || [];
+  const pills = tags.map(t => `<span class="tag-pill">${t.replace(/</g,'&lt;')}</span>`).join('');
+  const addBtn = `<button class="tag-add-btn" title="Edit tags">+</button>`;
+  return pills + addBtn;
+}
+
 function renderUnifiedTable() {
   document.getElementById('unifiedTableWrap').style.display = 'block';
   const eoxCols     = unifiedColMeta.eox     || [];
@@ -2899,22 +3017,26 @@ function renderUnifiedTable() {
                 : bugCols.includes(h)     ? 'bug-col'
                 : urgencyCols.includes(h) ? 'urgency-col' : '';
       return `<th class="${cls}">${h}</th>`;
-    }).join('') + '</tr>';
+    }).join('') + '<th class="tag-col">Tags</th></tr>';
   renderUnifiedPage(unifiedPage);
 }
 
 function renderUnifiedPage(page) {
   unifiedPage = page;
+  const source = (_tagFilter ? _filteredRows : unifiedRows);
   const start = (page - 1) * PAGE_SIZE;
-  const slice = unifiedRows.slice(start, start + PAGE_SIZE);
+  const slice = source.slice(start, start + PAGE_SIZE);
   const eoxCols     = unifiedColMeta.eox     || [];
   const covCols     = unifiedColMeta.cov     || [];
   const swimCols    = unifiedColMeta.swim    || [];
   const psirtCols   = unifiedColMeta.psirt   || [];
   const bugCols     = unifiedColMeta.bug     || [];
   const urgencyCols = unifiedColMeta.urgency || [];
-  document.getElementById('unifiedTbody').innerHTML = slice.map(row =>
-    '<tr>' + unifiedHeaders.map(h => {
+  document.getElementById('unifiedTbody').innerHTML = slice.map(row => {
+    const did = _rowDeviceId(row);
+    const safeId = did.replace(/'/g, "\\'");
+    const tagCell = `<td class="tag-cell" data-did="${did.replace(/"/g,'&quot;')}" onclick="openTagModal('${safeId}')">${_tagCellHtml(did)}</td>`;
+    return '<tr>' + unifiedHeaders.map(h => {
       const v = row[h];
       const d = (v === null || v === undefined || v === '') ? '' : String(v);
       if (h === 'EOX Compliance')     return `<td>${eoxComplianceBadge(d)}</td>`;
@@ -2931,9 +3053,130 @@ function renderUnifiedPage(page) {
         return `<td class="${!d?'na':'mono'}" title="${d.replace(/"/g,'&quot;')}">${d||'N/A'}</td>`;
       }
       return `<td title="${d.replace(/"/g,'&quot;')}">${d}</td>`;
-    }).join('') + '</tr>'
-  ).join('');
+    }).join('') + tagCell + '</tr>';
+  }).join('');
   renderUnifiedPagination();
+}
+
+// ── Device Tag helpers ────────────────────────────────────────────────────────
+async function fetchAllDeviceTags() {
+  try {
+    const resp = await fetch('/tags/all');
+    const data = await resp.json();
+    Object.assign(_deviceTags, data);
+    // re-render tag cells on current page without full page redraw
+    document.querySelectorAll('.tag-cell').forEach(td => {
+      const did = td.dataset.did || '';
+      const safeId = did.replace(/'/g, "\\'");
+      td.innerHTML = _tagCellHtml(did);
+      td.onclick = () => openTagModal(did);
+    });
+    updateTagFilterPills();
+  } catch(e) { /* silent */ }
+}
+
+function applyTagFilter() {
+  _tagFilter = (document.getElementById('tagFilterInput').value || '').trim().toLowerCase();
+  if (_tagFilter) {
+    _filteredRows = unifiedRows.filter(row => {
+      const did = _rowDeviceId(row);
+      return (_deviceTags[did] || []).some(t => t.toLowerCase().includes(_tagFilter));
+    });
+    const cnt = _filteredRows.length;
+    document.getElementById('tagFilterCount').textContent = `${cnt} row${cnt!==1?'s':''} match`;
+    document.getElementById('tagFilterClear').style.display = 'inline-block';
+  } else {
+    _filteredRows = unifiedRows;
+    document.getElementById('tagFilterCount').textContent = '';
+    document.getElementById('tagFilterClear').style.display = 'none';
+  }
+  unifiedPage = 1;
+  renderUnifiedPage(1);
+}
+
+function clearTagFilter() {
+  document.getElementById('tagFilterInput').value = '';
+  applyTagFilter();
+}
+
+function updateTagFilterPills() {
+  // show all unique tags as clickable filter suggestions
+  const all = new Set();
+  for (const tags of Object.values(_deviceTags)) tags.forEach(t => all.add(t));
+  const pillsEl = document.getElementById('tagFilterPills');
+  pillsEl.innerHTML = [...all].sort().map(t =>
+    `<span class="tag-pill" style="cursor:pointer" onclick="document.getElementById('tagFilterInput').value='${t.replace(/'/g,"\\'")}';applyTagFilter()" title="Filter by ${t}">${t.replace(/</g,'&lt;')}</span>`
+  ).join('');
+}
+
+let _tagEditDid = '';
+
+function openTagModal(did) {
+  _tagEditDid = did;
+  document.getElementById('tagModalTitle').textContent = did || '(unknown)';
+  document.getElementById('tagModalError').textContent = '';
+  document.getElementById('tagNewInput').value = '';
+  renderTagModalList();
+  document.getElementById('tagModal').style.display = 'flex';
+  document.getElementById('tagNewInput').focus();
+}
+
+function closeTagModal() {
+  document.getElementById('tagModal').style.display = 'none';
+  _tagEditDid = '';
+}
+
+function renderTagModalList() {
+  const tags = _deviceTags[_tagEditDid] || [];
+  document.getElementById('tagModalList').innerHTML = tags.length
+    ? tags.map(t =>
+        `<span class="tag-pill" style="gap:0.3rem">${t.replace(/</g,'&lt;')} `+
+        `<button onclick="removeDeviceTag('${t.replace(/'/g,"\\'")}',this)" `+
+        `style="background:none;border:none;color:#f85149;cursor:pointer;padding:0;font-size:0.8rem;line-height:1">×</button></span>`
+      ).join('')
+    : '<span style="color:#6e7681;font-size:0.8rem">No tags yet.</span>';
+}
+
+async function addDeviceTag() {
+  const inp = document.getElementById('tagNewInput');
+  const tag = inp.value.trim();
+  const errEl = document.getElementById('tagModalError');
+  if (!tag) return;
+  if (!_tagEditDid) return;
+  const cur = _deviceTags[_tagEditDid] || [];
+  if (cur.includes(tag)) { errEl.textContent = 'Tag already exists.'; return; }
+  errEl.textContent = '';
+  const newTags = [...cur, tag];
+  await _saveDeviceTags(_tagEditDid, newTags);
+  inp.value = '';
+}
+
+async function removeDeviceTag(tag, btn) {
+  if (!_tagEditDid) return;
+  const cur = _deviceTags[_tagEditDid] || [];
+  const newTags = cur.filter(t => t !== tag);
+  await _saveDeviceTags(_tagEditDid, newTags);
+}
+
+async function _saveDeviceTags(did, tags) {
+  try {
+    const resp = await fetch(`/tags/${encodeURIComponent(did)}`, {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({tags})
+    });
+    const data = await resp.json();
+    _deviceTags[did] = data.tags || tags;
+  } catch(e) {
+    _deviceTags[did] = tags;
+  }
+  renderTagModalList();
+  // update tag cells on current page
+  document.querySelectorAll(`.tag-cell[data-did="${did.replace(/"/g,'&quot;')}"]`).forEach(td => {
+    td.innerHTML = _tagCellHtml(did);
+  });
+  updateTagFilterPills();
+  if (_tagFilter) applyTagFilter();
 }
 
 function eoxComplianceBadge(label) {
@@ -2946,7 +3189,7 @@ function eoxComplianceBadge(label) {
 }
 
 function renderUnifiedPagination() {
-  const total = unifiedRows.length;
+  const total = (_tagFilter ? _filteredRows : unifiedRows).length;
   const pages = Math.ceil(total / PAGE_SIZE);
   const pg = document.getElementById('unifiedPagination');
   if (pages <= 1) { pg.innerHTML = ''; return; }
@@ -4808,6 +5051,40 @@ def baselines_delete(bid: str):
     if not _delete_baseline(bid):
         return jsonify({"error": "Not found"}), 404
     return jsonify({"ok": True})
+
+
+# ── Device tags routes ────────────────────────────────────────────────────────
+@app.route("/tags/batch", methods=["POST"])
+def tags_batch():
+    data = request.get_json(force=True) or {}
+    device_ids = [str(d).strip() for d in (data.get("device_ids") or []) if d]
+    return jsonify(_batch_get_device_tags(device_ids))
+
+
+@app.route("/tags/all", methods=["GET"])
+def tags_all():
+    return jsonify(_list_all_device_tags())
+
+
+@app.route("/tags/<path:device_id>", methods=["GET"])
+def tags_get(device_id: str):
+    return jsonify({"device_id": device_id, "tags": _get_device_tags(device_id)})
+
+
+@app.route("/tags/<path:device_id>", methods=["PUT"])
+def tags_put(device_id: str):
+    data = request.get_json(force=True) or {}
+    tags = list(data.get("tags") or [])
+    saved = _set_device_tags(device_id, tags)
+    return jsonify({"device_id": device_id, "tags": saved})
+
+
+@app.route("/tags/<path:device_id>/<tag>", methods=["DELETE"])
+def tags_delete_tag(device_id: str, tag: str):
+    cur = _get_device_tags(device_id)
+    new_tags = [t for t in cur if t != tag]
+    saved = _set_device_tags(device_id, new_tags)
+    return jsonify({"device_id": device_id, "tags": saved})
 
 
 @app.route("/config-diff/explain", methods=["POST"])
