@@ -498,11 +498,12 @@ Imports `cisco_eox`, `cisco_swim`, `cisco_psirt`, `cisco_sn2info`, and `cisco_bu
 3. **Requires at least a PID or SN column** — returns `needs_mapping` (context: `"unified"`) if neither found
 4. Runs all five lookups in sequence: EOX → Coverage (SN2INFO) → SWIM → PSIRT → Bug
 5. For SWIM/Bug when no PID column: uses `orderable_pid` resolved from SN2INFO coverage lookup
-6. Appends 22 new columns total: 7 EOX + 4 Coverage + 3 SWIM + 4 PSIRT + 4 Bug
+6. Appends 24 new columns total: 7 EOX + 4 Coverage + 3 SWIM + 4 PSIRT + 4 Bug + 2 Urgency
 7. Coverage columns populated only when SN column is present
 8. Rows without a version value get `PSIRT Compliance = NA`
 9. Rows without a resolvable PID get `Bug Compliance = NA`
-10. Stores enriched DataFrame in the shared SQLite job store
+10. Computes Urgency Score (0–100) and Urgency Level (Critical/High/Medium/Low) from all compliance signals
+11. Stores enriched DataFrame in the shared SQLite job store
 
 **Starting the web app:**
 ```bash

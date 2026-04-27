@@ -204,6 +204,12 @@ BUG_COLS = [
     ("Bug Fixed Count", "critical_count"),
 ]
 
+# ── Urgency Score columns ─────────────────────────────────────────────────────
+URGENCY_COLS = [
+    ("Urgency Score", "urgency_score"),
+    ("Urgency Level", "urgency_level"),
+]
+
 # ── Batched lookups ──────────────────────────────────────────────────────────
 def _build_pid_lookup(pids: list[str]) -> dict[str, dict]:
     """Query EOX API for a list of unique PIDs (batched 20 at a time)."""
@@ -265,6 +271,32 @@ def _build_psirt_lookup(
             print(f"PSIRT lookup failed for {os_type}/{version}: {exc}", file=sys.stderr)
             lookup[key] = {}
     return lookup
+
+
+def _compute_urgency(row: dict) -> tuple[int, str]:
+    """Compute 0-100 urgency score from EOX/PSIRT/Bug/Coverage compliance columns."""
+    score = 0
+    eox = str(row.get("EOX Compliance", "")).lower()
+    if "noncompliant" in eox:
+        score += 40
+    elif "warning" in eox:
+        score += 20
+    if str(row.get("PSIRT Compliance", "")).lower() == "non-compliant":
+        score += 30
+    if str(row.get("Bug Compliance", "")).lower() == "non-compliant":
+        score += 20
+    if str(row.get("Coverage Status", "")).lower() == "inactive":
+        score += 10
+    score = min(score, 100)
+    if score >= 70:
+        level = "Critical"
+    elif score >= 40:
+        level = "High"
+    elif score >= 10:
+        level = "Medium"
+    else:
+        level = "Low"
+    return score, level
 
 
 def _build_bug_lookup(
@@ -524,7 +556,8 @@ select:focus { outline: none; border-color: #1f6feb; }
 thead th.cov-col   { color: #3fb950; }
 thead th.swim-col  { color: #e3b341; }
 thead th.psirt-col { color: #f85149; }
-thead th.bug-col   { color: #a371f7; }
+thead th.bug-col     { color: #a371f7; }
+thead th.urgency-col { color: #f0883e; }
 
 /* Config Diff risk colours */
 .diff-add     { background: rgba(63,185,80,0.06); }
@@ -1082,6 +1115,10 @@ thead th.bug-col   { color: #a371f7; }
         <div style="flex:1;min-width:260px;max-width:340px">
           <h3 style="font-size:0.9rem;color:#8b949e;margin-bottom:0.75rem">Bug Compliance (all Bug / Unified jobs)</h3>
           <canvas id="dashBugDonut" height="200"></canvas>
+        </div>
+        <div style="flex:1;min-width:260px;max-width:340px">
+          <h3 style="font-size:0.9rem;color:#8b949e;margin-bottom:0.75rem">Urgency Distribution (Unified jobs)</h3>
+          <canvas id="dashUrgencyDonut" height="200"></canvas>
         </div>
       </div>
       <div style="margin-bottom:2rem">
@@ -2150,23 +2187,39 @@ function renderUnifiedSummary(s) {
     <span class="pill pill-uk">${s.psirt_na} NA</span>
     <span class="pill pill-c">${s.bug_compliant||0} Bug Compliant</span>
     <span class="pill pill-nc">${s.bug_non_compliant||0} Bug NC</span>
-    <span class="pill pill-uk">${s.bug_na||0} Bug NA</span>`;
+    <span class="pill pill-uk">${s.bug_na||0} Bug NA</span>
+    <span class="pill" style="background:#f8514922;color:#f85149">${s.urgency_critical||0} Urgency Critical</span>
+    <span class="pill" style="background:#d2992222;color:#d29922">${s.urgency_high||0} High</span>
+    <span class="pill" style="background:#388bfd22;color:#388bfd">${s.urgency_medium||0} Medium</span>
+    <span class="pill pill-c">${s.urgency_low||0} Low</span>`;
+}
+
+function urgencyBadge(level) {
+  if (!level) return '<span class="badge-sm badge-sm-uk">—</span>';
+  const l = level.toLowerCase();
+  if (l === 'critical') return `<span class="badge-sm" style="background:#f851491a;color:#f85149">${level}</span>`;
+  if (l === 'high')     return `<span class="badge-sm" style="background:#d299221a;color:#d29922">${level}</span>`;
+  if (l === 'medium')   return `<span class="badge-sm" style="background:#388bfd1a;color:#388bfd">${level}</span>`;
+  if (l === 'low')      return `<span class="badge-sm" style="background:#3fb9501a;color:#3fb950">${level}</span>`;
+  return `<span class="badge-sm badge-sm-uk">${level}</span>`;
 }
 
 function renderUnifiedTable() {
   document.getElementById('unifiedTableWrap').style.display = 'block';
-  const eoxCols   = unifiedColMeta.eox   || [];
-  const covCols   = unifiedColMeta.cov   || [];
-  const swimCols  = unifiedColMeta.swim  || [];
-  const psirtCols = unifiedColMeta.psirt || [];
-  const bugCols   = unifiedColMeta.bug   || [];
+  const eoxCols     = unifiedColMeta.eox     || [];
+  const covCols     = unifiedColMeta.cov     || [];
+  const swimCols    = unifiedColMeta.swim    || [];
+  const psirtCols   = unifiedColMeta.psirt   || [];
+  const bugCols     = unifiedColMeta.bug     || [];
+  const urgencyCols = unifiedColMeta.urgency || [];
   document.getElementById('unifiedThead').innerHTML =
     '<tr>' + unifiedHeaders.map(h => {
-      const cls = eoxCols.includes(h)   ? 'eox-col'
-                : covCols.includes(h)   ? 'cov-col'
-                : swimCols.includes(h)  ? 'swim-col'
-                : psirtCols.includes(h) ? 'psirt-col'
-                : bugCols.includes(h)   ? 'bug-col' : '';
+      const cls = eoxCols.includes(h)     ? 'eox-col'
+                : covCols.includes(h)     ? 'cov-col'
+                : swimCols.includes(h)    ? 'swim-col'
+                : psirtCols.includes(h)   ? 'psirt-col'
+                : bugCols.includes(h)     ? 'bug-col'
+                : urgencyCols.includes(h) ? 'urgency-col' : '';
       return `<th class="${cls}">${h}</th>`;
     }).join('') + '</tr>';
   renderUnifiedPage(unifiedPage);
@@ -2176,11 +2229,12 @@ function renderUnifiedPage(page) {
   unifiedPage = page;
   const start = (page - 1) * PAGE_SIZE;
   const slice = unifiedRows.slice(start, start + PAGE_SIZE);
-  const eoxCols   = unifiedColMeta.eox   || [];
-  const covCols   = unifiedColMeta.cov   || [];
-  const swimCols  = unifiedColMeta.swim  || [];
-  const psirtCols = unifiedColMeta.psirt || [];
-  const bugCols   = unifiedColMeta.bug   || [];
+  const eoxCols     = unifiedColMeta.eox     || [];
+  const covCols     = unifiedColMeta.cov     || [];
+  const swimCols    = unifiedColMeta.swim    || [];
+  const psirtCols   = unifiedColMeta.psirt   || [];
+  const bugCols     = unifiedColMeta.bug     || [];
+  const urgencyCols = unifiedColMeta.urgency || [];
   document.getElementById('unifiedTbody').innerHTML = slice.map(row =>
     '<tr>' + unifiedHeaders.map(h => {
       const v = row[h];
@@ -2190,10 +2244,12 @@ function renderUnifiedPage(page) {
       if (h === 'SWIM Compliance')    return `<td>${swimComplianceBadge(d)}</td>`;
       if (h === 'PSIRT Compliance')   return `<td>${psirtComplianceBadge(d)}</td>`;
       if (h === 'Bug Compliance')     return `<td>${bugComplianceBadge(d)}</td>`;
+      if (h === 'Urgency Level')      return `<td>${urgencyBadge(d)}</td>`;
+      if (h === 'Urgency Score')      return `<td class="mono" style="text-align:right">${d}</td>`;
       if (eoxCols.includes(h) || covCols.includes(h) || swimCols.includes(h)) {
         return `<td class="${!d?'na':'mono'}">${d||'N/A'}</td>`;
       }
-      if (psirtCols.includes(h) || bugCols.includes(h)) {
+      if (psirtCols.includes(h) || bugCols.includes(h) || urgencyCols.includes(h)) {
         return `<td class="${!d?'na':'mono'}" title="${d.replace(/"/g,'&quot;')}">${d||'N/A'}</td>`;
       }
       return `<td title="${d.replace(/"/g,'&quot;')}">${d}</td>`;
@@ -2336,6 +2392,8 @@ function renderDashboard(jobs) {
   let covA = 0, covI = 0, covU = 0;
   // Aggregate Bug compliance
   let bugC = 0, bugNC = 0, bugNA = 0;
+  // Aggregate Urgency distribution
+  let urgCrit = 0, urgHigh = 0, urgMed = 0, urgLow = 0;
 
   const trend = jobs.slice(0, 30).reverse().map(j => ({
     label: `${j.job_type.toUpperCase()} ${new Date(j.created_at*1000).toLocaleDateString()}`,
@@ -2365,6 +2423,12 @@ function renderDashboard(jobs) {
       bugC  += (s.compliant        || s.bug_compliant     || 0);
       bugNC += (s.non_compliant    || s.bug_non_compliant || 0);
       bugNA += (s.na               || s.bug_na            || 0);
+    }
+    if (j.job_type === 'unified') {
+      urgCrit += (s.urgency_critical || 0);
+      urgHigh += (s.urgency_high     || 0);
+      urgMed  += (s.urgency_medium   || 0);
+      urgLow  += (s.urgency_low      || 0);
     }
   }
 
@@ -2406,6 +2470,12 @@ function renderDashboard(jobs) {
     ['Compliant', 'Non-Compliant', 'NA'],
     [bugC, bugNC, bugNA],
     ['#3fb950', '#f85149', '#6e7681']
+  ));
+
+  rebuildChart('dashUrgencyDonut', donutOpts(
+    ['Critical', 'High', 'Medium', 'Low'],
+    [urgCrit, urgHigh, urgMed, urgLow],
+    ['#f85149', '#d29922', '#388bfd', '#3fb950']
   ));
 
   const typeColor = t => t === 'eox' ? '#58a6ff' : t === 'psirt' ? '#f85149' : t === 'swim' ? '#e3b341' : t === 'bug' ? '#a371f7' : '#3fb950';
@@ -3675,13 +3745,14 @@ def unified_upload():
         return jsonify({"error": f"Bug API error: {e}"}), 502
 
     # ── Add enriched columns ─────────────────────────────────────────────────
-    eox_col_names   = [c[0] for c in EOX_COLS]
-    cov_col_names   = [c[0] for c in COVERAGE_COLS]
-    swim_col_names  = [c[0] for c in SWIM_COLS]
-    psirt_col_names = [c[0] for c in PSIRT_COLS]
-    bug_col_names   = [c[0] for c in BUG_COLS]
+    eox_col_names     = [c[0] for c in EOX_COLS]
+    cov_col_names     = [c[0] for c in COVERAGE_COLS]
+    swim_col_names    = [c[0] for c in SWIM_COLS]
+    psirt_col_names   = [c[0] for c in PSIRT_COLS]
+    bug_col_names     = [c[0] for c in BUG_COLS]
+    urgency_col_names = [c[0] for c in URGENCY_COLS]
 
-    for name in eox_col_names + cov_col_names + swim_col_names + psirt_col_names + bug_col_names:
+    for name in eox_col_names + cov_col_names + swim_col_names + psirt_col_names + bug_col_names + urgency_col_names:
         df[name] = ""
 
     for idx, row in df.iterrows():
@@ -3755,10 +3826,16 @@ def unified_upload():
             df.at[idx, "Bug IDs"]         = brec.get("bug_ids", "")
             df.at[idx, "Bug Fixed Count"] = str(brec.get("critical_count", "")) if brec else ""
 
+        # Urgency Score
+        score, level = _compute_urgency(row.to_dict())
+        df.at[idx, "Urgency Score"] = score
+        df.at[idx, "Urgency Level"] = level
+
     # ── Stats ─────────────────────────────────────────────────────────────────
-    cov_col   = df["Coverage Status"]
-    psirt_col = df["PSIRT Compliance"]
-    bug_col   = df["Bug Compliance"]
+    cov_col     = df["Coverage Status"]
+    psirt_col   = df["PSIRT Compliance"]
+    bug_col     = df["Bug Compliance"]
+    urgency_col = df["Urgency Level"]
     stats = {
         "total":               len(df),
         "coverage_active":    int((cov_col == "Active").sum()),
@@ -3770,6 +3847,10 @@ def unified_upload():
         "bug_compliant":       int((bug_col == "Compliant").sum()),
         "bug_non_compliant":   int((bug_col == "Non-Compliant").sum()),
         "bug_na":              int(((bug_col == "NA") | (bug_col == "")).sum()),
+        "urgency_critical":    int((urgency_col == "Critical").sum()),
+        "urgency_high":        int((urgency_col == "High").sum()),
+        "urgency_medium":      int((urgency_col == "Medium").sum()),
+        "urgency_low":         int((urgency_col == "Low").sum()),
     }
 
     job_id = str(uuid.uuid4())[:8]
@@ -3786,11 +3867,12 @@ def unified_upload():
         "default_os_type": default_os_type,
         "headers":         list(df.columns),
         "col_meta": {
-            "eox":   eox_col_names,
-            "cov":   cov_col_names,
-            "swim":  swim_col_names,
-            "psirt": psirt_col_names,
-            "bug":   bug_col_names,
+            "eox":     eox_col_names,
+            "cov":     cov_col_names,
+            "swim":    swim_col_names,
+            "psirt":   psirt_col_names,
+            "bug":     bug_col_names,
+            "urgency": urgency_col_names,
         },
         "rows":  df.to_dict(orient="records"),
         "stats": stats,
