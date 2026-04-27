@@ -693,7 +693,26 @@ thead th.urgency-col { color: #f0883e; }
     <a id="downloadLink" class="btn-green" href="#">⬇ Download Enriched Excel</a>
     <a id="downloadHtmlLink" class="btn-secondary" href="#" target="_blank" style="margin-left:0.5rem">⎙ HTML Report</a>
     <button class="btn-secondary" onclick="saveCurrentList('eox')" style="margin-left:0.5rem">💾 Save List</button>
+    <button class="btn-secondary" onclick="toggleEoxTimeline()" style="margin-left:0.5rem">📅 Timeline</button>
     <span style="font-size:0.8rem;color:#6e7681;margin-left:0.75rem">Includes all original columns + EOX dates</span>
+  </div>
+
+  <div id="eoxTimelineWrap" style="max-width:1200px;margin:0 auto 1.5rem;display:none">
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
+        <div>
+          <h3 style="margin:0;font-size:0.95rem">EOX Lifecycle Timeline</h3>
+          <p style="margin:0.25rem 0 0;font-size:0.78rem;color:#8b949e">Days until Last Date of Support — top 25 devices by urgency. Red = past/critical, Amber = warning (&lt;180 days), Green = compliant.</p>
+        </div>
+        <div style="display:flex;gap:0.5rem">
+          <button class="btn-secondary" style="font-size:0.75rem" onclick="renderEoxTimeline('ldos')">By LDoS</button>
+          <button class="btn-secondary" style="font-size:0.75rem" onclick="renderEoxTimeline('eos')">By EoS</button>
+        </div>
+      </div>
+      <div style="position:relative;height:420px">
+        <canvas id="eoxTimelineChart"></canvas>
+      </div>
+    </div>
   </div>
 
   <div id="bulkTableWrap" class="table-wrap" style="display:none">
@@ -1552,6 +1571,99 @@ function applyHistory(i) {
 }
 
 renderHistory();
+
+// ── EOX Timeline Chart ────────────────────────────────────────────────────────
+let _eoxTimelineChart = null;
+
+function toggleEoxTimeline() {
+  const wrap = document.getElementById('eoxTimelineWrap');
+  if (wrap.style.display === 'none') {
+    wrap.style.display = 'block';
+    renderEoxTimeline('ldos');
+  } else {
+    wrap.style.display = 'none';
+  }
+}
+
+function renderEoxTimeline(mode) {
+  const today = Date.now();
+  const MS_PER_DAY = 86400000;
+  const WARN_DAYS  = 180;
+
+  const dateCol = mode === 'eos' ? 'EOX End of Sale' : 'EOX Last Date of Support';
+  const pidCol  = bulkHeaders.find(h => !eoxColNames.includes(h) && h !== '');
+
+  // Build dataset: devices that have the requested date
+  let items = bulkRows
+    .map(row => {
+      const label = pidCol ? String(row[pidCol] || '').trim() : '';
+      const raw   = String(row[dateCol] || '').trim();
+      if (!raw || raw === 'N/A') return null;
+      const ts = Date.parse(raw);
+      if (isNaN(ts)) return null;
+      const days = Math.round((ts - today) / MS_PER_DAY);
+      return { label: label || raw, days, ts };
+    })
+    .filter(Boolean);
+
+  // Sort ascending (most urgent first), cap at 25
+  items.sort((a, b) => a.days - b.days);
+  items = items.slice(0, 25);
+
+  const labels = items.map(d => d.label);
+  const data   = items.map(d => d.days);
+  const colors = data.map(d =>
+    d < 0          ? '#f85149' :
+    d < WARN_DAYS  ? '#e3b341' : '#3fb950'
+  );
+
+  const ctx = document.getElementById('eoxTimelineChart').getContext('2d');
+  if (_eoxTimelineChart) _eoxTimelineChart.destroy();
+  _eoxTimelineChart = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{
+        label: dateCol,
+        data,
+        backgroundColor: colors,
+        borderRadius: 3,
+        borderSkipped: false,
+      }]
+    },
+    options: {
+      indexAxis: 'y',
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: ctx => {
+              const d = ctx.parsed.x;
+              if (d < 0) return `${Math.abs(d)} days past (${dateCol})`;
+              return `${d} days remaining (${dateCol})`;
+            }
+          }
+        }
+      },
+      scales: {
+        x: {
+          ticks: {
+            color: '#8b949e',
+            callback: v => v === 0 ? 'Today' : `${v > 0 ? '+' : ''}${v}d`,
+          },
+          grid: { color: '#21262d' },
+          title: { display: true, text: 'Days from Today', color: '#6e7681' }
+        },
+        y: {
+          ticks: { color: '#c9d1d9', font: { size: 11 } },
+          grid: { color: '#21262d' }
+        }
+      }
+    }
+  });
+}
 
 // ── SWIM Single Search ────────────────────────────────────────────────────────
 const swimSearchForm   = document.getElementById('swimSearchForm');
