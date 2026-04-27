@@ -1074,6 +1074,66 @@ thead th.urgency-col { color: #f0883e; }
     </div>
   </div>
 
+  <!-- Import from NetBox / ServiceNow -->
+  <div class="card" style="margin-top:1rem">
+    <h3 style="margin-top:0;font-size:0.95rem">Import from NetBox or ServiceNow</h3>
+    <p style="font-size:0.82rem;color:#8b949e;margin:0 0 1rem">Fetch devices directly from your CMDB — no spreadsheet needed. The imported list is loaded into the drop zone above and auto-processed.</p>
+
+    <div style="display:flex;gap:0.5rem;margin-bottom:1rem">
+      <button class="btn-secondary" style="font-size:0.8rem" onclick="toggleImportSection('netbox')">NetBox</button>
+      <button class="btn-secondary" style="font-size:0.8rem" onclick="toggleImportSection('servicenow')">ServiceNow</button>
+    </div>
+
+    <div id="importNetboxForm" style="display:none;padding:0.75rem;background:#0d1117;border-radius:6px;border:1px solid #30363d;margin-bottom:0.75rem">
+      <div class="form-row">
+        <div>
+          <label>NetBox URL</label>
+          <input type="text" id="nbUrl" placeholder="https://netbox.example.com" autocomplete="off">
+        </div>
+        <div>
+          <label>API Token</label>
+          <input type="password" id="nbToken" placeholder="Token …" autocomplete="off">
+        </div>
+      </div>
+      <div style="display:flex;gap:0.5rem;align-items:center;margin-top:0.5rem">
+        <label style="font-size:0.8rem;white-space:nowrap">Max devices:</label>
+        <input type="number" id="nbLimit" value="200" min="1" max="1000" style="width:80px;font-size:0.8rem;padding:0.3rem 0.5rem">
+        <button class="btn-primary" style="font-size:0.8rem" onclick="runImport('netbox')">Import</button>
+        <span id="nbStatus" class="status-msg"></span>
+      </div>
+    </div>
+
+    <div id="importSnowForm" style="display:none;padding:0.75rem;background:#0d1117;border-radius:6px;border:1px solid #30363d;margin-bottom:0.75rem">
+      <div class="form-row">
+        <div>
+          <label>ServiceNow URL</label>
+          <input type="text" id="snowUrl" placeholder="https://instance.service-now.com" autocomplete="off">
+        </div>
+        <div>
+          <label>CMDB Table</label>
+          <input type="text" id="snowTable" value="cmdb_ci_ip_switch" autocomplete="off">
+          <div class="hint">e.g. cmdb_ci_ip_switch · cmdb_ci_ip_router</div>
+        </div>
+      </div>
+      <div class="form-row">
+        <div>
+          <label>Username</label>
+          <input type="text" id="snowUser" autocomplete="off">
+        </div>
+        <div>
+          <label>Password</label>
+          <input type="password" id="snowPass" autocomplete="off">
+        </div>
+      </div>
+      <div style="display:flex;gap:0.5rem;align-items:center;margin-top:0.5rem">
+        <label style="font-size:0.8rem;white-space:nowrap">Max records:</label>
+        <input type="number" id="snowLimit" value="200" min="1" max="1000" style="width:80px;font-size:0.8rem;padding:0.3rem 0.5rem">
+        <button class="btn-primary" style="font-size:0.8rem" onclick="runImport('servicenow')">Import</button>
+        <span id="snowStatus" class="status-msg"></span>
+      </div>
+    </div>
+  </div>
+
   <div id="unifiedSummaryBar"  class="summary-bar"                        style="display:none"></div>
   <div id="unifiedDownloadBar" style="max-width:1200px;margin:0 auto 1rem;display:none">
     <a id="unifiedDownloadLink" class="btn-green" href="#">⬇ Download Unified Report</a>
@@ -3094,6 +3154,75 @@ function renderDashboard(jobs) {
     </table>`;
 }
 
+// ── CMDB Import (NetBox / ServiceNow) ────────────────────────────────────────
+function toggleImportSection(source) {
+  const sections = {netbox: 'importNetboxForm', servicenow: 'importSnowForm'};
+  Object.entries(sections).forEach(([k, id]) => {
+    document.getElementById(id).style.display = (k === source)
+      ? (document.getElementById(id).style.display === 'none' ? 'block' : 'none')
+      : 'none';
+  });
+}
+
+async function runImport(source) {
+  const statusEl = source === 'netbox'
+    ? document.getElementById('nbStatus')
+    : document.getElementById('snowStatus');
+  statusEl.textContent = 'Fetching…';
+
+  let body;
+  if (source === 'netbox') {
+    body = {
+      url:   document.getElementById('nbUrl').value.trim(),
+      token: document.getElementById('nbToken').value.trim(),
+      limit: parseInt(document.getElementById('nbLimit').value) || 200,
+    };
+  } else {
+    body = {
+      url:      document.getElementById('snowUrl').value.trim(),
+      username: document.getElementById('snowUser').value.trim(),
+      password: document.getElementById('snowPass').value.trim(),
+      table:    document.getElementById('snowTable').value.trim() || 'cmdb_ci_ip_switch',
+      limit:    parseInt(document.getElementById('snowLimit').value) || 200,
+    };
+  }
+
+  try {
+    const resp = await fetch(`/import/${source}`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    if (data.error) { statusEl.textContent = 'Error: ' + data.error; return; }
+
+    statusEl.textContent = `${data.count} devices fetched — loading into Unified Report…`;
+
+    // Build CSV from device list
+    const devices = data.devices;
+    if (!devices.length) { statusEl.textContent = 'No devices returned.'; return; }
+    const cols   = Object.keys(devices[0]);
+    const csvRows = [cols.join(','), ...devices.map(d =>
+      cols.map(c => JSON.stringify(d[c] ?? '')).join(',')
+    )];
+    const csvBlob = new Blob([csvRows.join('\n')], {type: 'text/csv'});
+    const file    = new File([csvBlob], `${source}_devices.csv`, {type: 'text/csv'});
+
+    // Inject into the unified file input and trigger upload
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    const inp = document.getElementById('unifiedFileInput');
+    inp.files = dt.files;
+    inp.dispatchEvent(new Event('change'));
+
+    // Scroll to top of unified tab
+    document.getElementById('tab-unified').scrollIntoView({behavior: 'smooth'});
+    statusEl.textContent = `✓ ${data.count} devices loaded — click Process File.`;
+  } catch(err) {
+    statusEl.textContent = 'Error: ' + err.message;
+  }
+}
+
 // ── Bugs Tab ──────────────────────────────────────────────────────────────────
 let bugRows    = [];
 let bugHeaders = [];
@@ -4529,6 +4658,71 @@ def baselines_delete(bid: str):
     if not _delete_baseline(bid):
         return jsonify({"error": "Not found"}), 404
     return jsonify({"ok": True})
+
+
+@app.route("/import/netbox", methods=["POST"])
+def import_netbox():
+    data   = request.get_json(force=True) or {}
+    url    = (data.get("url") or "").rstrip("/")
+    token  = (data.get("token") or "").strip()
+    limit  = min(int(data.get("limit") or 200), 1000)
+    if not url or not token:
+        return jsonify({"error": "url and token are required"}), 400
+    try:
+        import requests as _req
+        headers = {"Authorization": f"Token {token}", "Accept": "application/json"}
+        resp    = _req.get(f"{url}/api/dcim/devices/",
+                           params={"limit": limit}, headers=headers, timeout=15)
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+    except Exception as exc:
+        return jsonify({"error": f"NetBox request failed: {exc}"}), 502
+
+    devices = []
+    for d in results:
+        pid    = (d.get("device_type") or {}).get("model", "")
+        serial = d.get("serial", "")
+        name   = d.get("name", "")
+        site   = (d.get("site") or {}).get("name", "")
+        devices.append({"Device Name": name, "Product ID": pid,
+                        "Serial Number": serial, "Site": site})
+    return jsonify({"source": "netbox", "count": len(devices), "devices": devices})
+
+
+@app.route("/import/servicenow", methods=["POST"])
+def import_servicenow():
+    data     = request.get_json(force=True) or {}
+    url      = (data.get("url") or "").rstrip("/")
+    username = (data.get("username") or "").strip()
+    password = (data.get("password") or "").strip()
+    table    = (data.get("table") or "cmdb_ci_ip_switch").strip()
+    limit    = min(int(data.get("limit") or 200), 1000)
+    if not url or not username or not password:
+        return jsonify({"error": "url, username, and password are required"}), 400
+    try:
+        import requests as _req
+        fields = "name,model_id,serial_number,location"
+        resp   = _req.get(
+            f"{url}/api/now/table/{table}",
+            params={"sysparm_limit": limit, "sysparm_fields": fields},
+            auth=(username, password),
+            headers={"Accept": "application/json"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("result", [])
+    except Exception as exc:
+        return jsonify({"error": f"ServiceNow request failed: {exc}"}), 502
+
+    devices = []
+    for d in results:
+        pid      = (d.get("model_id") or {}).get("display_value", "") or d.get("model_id", "")
+        serial   = d.get("serial_number", "")
+        name     = d.get("name", "")
+        location = (d.get("location") or {}).get("display_value", "") or d.get("location", "")
+        devices.append({"Device Name": name, "Product ID": pid,
+                        "Serial Number": serial, "Location": location})
+    return jsonify({"source": "servicenow", "count": len(devices), "devices": devices})
 
 
 @app.route("/unified/upload", methods=["POST"])
