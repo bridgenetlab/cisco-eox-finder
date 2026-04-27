@@ -2402,12 +2402,18 @@ function renderPsirtResults(result) {
         <th style="text-align:left;padding:0.4rem 0.6rem;color:#8b949e;border-bottom:1px solid #30363d;white-space:nowrap">CVSS</th>
         <th style="text-align:left;padding:0.4rem 0.6rem;color:#8b949e;border-bottom:1px solid #30363d">CVEs</th>
         <th style="text-align:left;padding:0.4rem 0.6rem;color:#8b949e;border-bottom:1px solid #30363d;white-space:nowrap">Published</th>
+        <th style="padding:0.4rem 0.6rem;border-bottom:1px solid #30363d"></th>
       </tr></thead><tbody>`;
     for (const a of advs) {
-      const cves = (a.cves || []).join(', ') || 'N/A';
-      const url  = a.publication_url
+      const cveList = a.cves || [];
+      const cves    = cveList.join(', ') || 'N/A';
+      const url     = a.publication_url
         ? `<a href="${a.publication_url}" target="_blank" style="color:#58a6ff;font-family:monospace;font-size:0.78rem">${a.advisory_id}</a>`
         : `<span style="font-family:monospace">${a.advisory_id}</span>`;
+      const nvdBtn  = cveList.length
+        ? `<button class="btn-secondary" style="font-size:0.7rem;padding:0.15rem 0.4rem;white-space:nowrap"
+             onclick="lookupNvd(${JSON.stringify(cveList)},this)">🔍 NVD</button>`
+        : '';
       html += `<tr style="border-bottom:1px solid #21262d">
         <td style="padding:0.4rem 0.6rem">${psirtSirBadge(a.sir)}</td>
         <td style="padding:0.4rem 0.6rem;color:#c9d1d9;max-width:320px;overflow:hidden;text-overflow:ellipsis" title="${a.title.replace(/"/g,'&quot;')}">${a.title}</td>
@@ -2415,12 +2421,80 @@ function renderPsirtResults(result) {
         <td style="padding:0.4rem 0.6rem;color:#8b949e;font-family:monospace">${a.cvss_score || 'N/A'}</td>
         <td style="padding:0.4rem 0.6rem;color:#8b949e;max-width:200px;overflow:hidden;text-overflow:ellipsis" title="${cves}">${cves}</td>
         <td style="padding:0.4rem 0.6rem;color:#8b949e;white-space:nowrap;font-family:monospace">${(a.first_published||'').slice(0,10)||'N/A'}</td>
-      </tr>`;
+        <td style="padding:0.4rem 0.6rem">${nvdBtn}</td>
+      </tr>
+      <tr class="nvd-detail-row" style="display:none"><td colspan="7" style="padding:0;background:#0d1117"></td></tr>`;
     }
     html += '</tbody></table></div>';
   }
   html += '</div>';
   psirtResultsDiv.innerHTML = html;
+}
+
+// ── NVD CVE Deep-Dive ────────────────────────────────────────────────────────
+async function lookupNvd(cves, btn) {
+  const detailRow = btn.closest('tr').nextElementSibling;
+  if (!detailRow?.classList.contains('nvd-detail-row')) return;
+
+  // Toggle if already loaded
+  if (detailRow.style.display !== 'none') { detailRow.style.display = 'none'; btn.textContent = '🔍 NVD'; return; }
+
+  btn.textContent = '…';
+  btn.disabled    = true;
+  try {
+    const resp = await fetch('/nvd/cve', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({cves}),
+    });
+    const data = await resp.json();
+    if (data.error) { btn.textContent = '🔍 NVD'; btn.disabled = false; alert(data.error); return; }
+
+    const sevColor = s => s === 'CRITICAL' ? '#f85149' : s === 'HIGH' ? '#d29922' : s === 'MEDIUM' ? '#388bfd' : '#3fb950';
+
+    const rows = data.results.map(c => {
+      if (c.error) return `<tr><td colspan="5" style="padding:0.4rem 0.75rem;color:#f85149;font-family:monospace">${c.cve_id}: ${c.error}</td></tr>`;
+      const sc = c.severity ? sevColor(c.severity.toUpperCase()) : '#6e7681';
+      const refs = (c.references || []).map(r => `<a href="${r}" target="_blank" style="color:#58a6ff;font-size:0.72rem;display:block;word-break:break-all">${r}</a>`).join('');
+      return `<tr style="border-bottom:1px solid #21262d;vertical-align:top">
+        <td style="padding:0.4rem 0.75rem;white-space:nowrap">
+          <a href="${c.nvd_url}" target="_blank" style="color:#58a6ff;font-family:monospace;font-size:0.78rem">${c.cve_id}</a>
+        </td>
+        <td style="padding:0.4rem 0.75rem">
+          <span style="background:${sc}22;color:${sc};padding:0.1rem 0.4rem;border-radius:3px;font-size:0.72rem;font-weight:700">${c.severity||'—'}</span>
+          ${c.cvss_v3!=null?`<span style="margin-left:0.4rem;font-family:monospace;font-size:0.78rem">CVSSv3: ${c.cvss_v3}</span>`:''}
+          ${c.cvss_v2!=null&&c.cvss_v3==null?`<span style="margin-left:0.4rem;font-family:monospace;font-size:0.78rem">CVSSv2: ${c.cvss_v2}</span>`:''}
+        </td>
+        <td style="padding:0.4rem 0.75rem;color:#8b949e;font-size:0.75rem;max-width:400px">${(c.description||'').substring(0,300)}${(c.description||'').length>300?'…':''}</td>
+        <td style="padding:0.4rem 0.75rem;color:#6e7681;font-family:monospace;font-size:0.72rem;white-space:nowrap">
+          ${c.published||'—'}<br>mod ${c.modified||'—'}
+        </td>
+        <td style="padding:0.4rem 0.75rem">${refs}</td>
+      </tr>`;
+    }).join('');
+
+    detailRow.querySelector('td').innerHTML = `
+      <div style="padding:0.5rem 0.75rem;border-top:1px solid #30363d">
+        <span style="font-size:0.75rem;color:#8b949e;font-weight:600">NVD Detail</span>
+        <table style="width:100%;border-collapse:collapse;font-size:0.78rem;margin-top:0.5rem">
+          <thead><tr style="background:#0d1117">
+            <th style="text-align:left;padding:0.3rem 0.75rem;color:#6e7681;border-bottom:1px solid #21262d;white-space:nowrap">CVE ID</th>
+            <th style="text-align:left;padding:0.3rem 0.75rem;color:#6e7681;border-bottom:1px solid #21262d">Severity / CVSS</th>
+            <th style="text-align:left;padding:0.3rem 0.75rem;color:#6e7681;border-bottom:1px solid #21262d">Description</th>
+            <th style="text-align:left;padding:0.3rem 0.75rem;color:#6e7681;border-bottom:1px solid #21262d">Dates</th>
+            <th style="text-align:left;padding:0.3rem 0.75rem;color:#6e7681;border-bottom:1px solid #21262d">References</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`;
+    detailRow.style.display = '';
+    btn.textContent = '🔍 NVD ▲';
+  } catch(err) {
+    btn.textContent = '🔍 NVD';
+    alert('NVD lookup failed: ' + err.message);
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 // ── PSIRT Bulk Upload ─────────────────────────────────────────────────────────
@@ -5024,6 +5098,55 @@ def delete_list(list_id: str):
     if not _delete_saved_list(list_id):
         return jsonify({"error": "Not found"}), 404
     return jsonify({"ok": True})
+
+
+@app.route("/nvd/cve", methods=["POST"])
+def nvd_cve():
+    """Fetch CVE details from NIST NVD API v2 (no key required for basic queries)."""
+    data    = request.get_json(force=True) or {}
+    cve_ids = [c.strip().upper() for c in (data.get("cves") or []) if c.strip()]
+    if not cve_ids:
+        return jsonify({"error": "cves list is required"}), 400
+    cve_ids = cve_ids[:10]  # cap per request
+
+    import requests as _req
+    results = []
+    for cve_id in cve_ids:
+        try:
+            resp = _req.get(
+                f"https://services.nvd.nist.gov/rest/json/cves/2.0",
+                params={"cveId": cve_id}, timeout=10,
+                headers={"Accept": "application/json"},
+            )
+            resp.raise_for_status()
+            items = resp.json().get("vulnerabilities", [])
+            if not items:
+                results.append({"cve_id": cve_id, "error": "Not found in NVD"})
+                continue
+            cve  = items[0]["cve"]
+            desc = next((d["value"] for d in cve.get("descriptions", []) if d["lang"] == "en"), "")
+            metrics = cve.get("metrics", {})
+            cvss_v3 = (metrics.get("cvssMetricV31") or metrics.get("cvssMetricV30") or [{}])[0]
+            cvss_v2 = (metrics.get("cvssMetricV2") or [{}])[0]
+            score_v3  = (cvss_v3.get("cvssData") or {}).get("baseScore")
+            vector_v3 = (cvss_v3.get("cvssData") or {}).get("vectorString")
+            score_v2  = (cvss_v2.get("cvssData") or {}).get("baseScore")
+            severity  = (cvss_v3.get("cvssData") or {}).get("baseSeverity") or cvss_v2.get("baseSeverity", "")
+            results.append({
+                "cve_id":      cve_id,
+                "description": desc,
+                "cvss_v3":     score_v3,
+                "cvss_v2":     score_v2,
+                "severity":    severity,
+                "vector":      vector_v3,
+                "published":   cve.get("published", "")[:10],
+                "modified":    cve.get("lastModified", "")[:10],
+                "references":  [r["url"] for r in cve.get("references", [])[:3]],
+                "nvd_url":     f"https://nvd.nist.gov/vuln/detail/{cve_id}",
+            })
+        except Exception as exc:
+            results.append({"cve_id": cve_id, "error": str(exc)})
+    return jsonify({"results": results})
 
 
 @app.route("/settings/email-config")
