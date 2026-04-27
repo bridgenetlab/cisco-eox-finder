@@ -694,6 +694,7 @@ thead th.urgency-col { color: #f0883e; }
     <a id="downloadHtmlLink" class="btn-secondary" href="#" target="_blank" style="margin-left:0.5rem">⎙ HTML Report</a>
     <button class="btn-secondary" onclick="saveCurrentList('eox')" style="margin-left:0.5rem">💾 Save List</button>
     <button class="btn-secondary" onclick="toggleEoxTimeline()" style="margin-left:0.5rem">📅 Timeline</button>
+    <button class="btn-secondary" onclick="toggleMigrationAdvisor()" style="margin-left:0.5rem">🔀 Migration Advisor</button>
     <span style="font-size:0.8rem;color:#6e7681;margin-left:0.75rem">Includes all original columns + EOX dates</span>
   </div>
 
@@ -712,6 +713,17 @@ thead th.urgency-col { color: #f0883e; }
       <div style="position:relative;height:420px">
         <canvas id="eoxTimelineChart"></canvas>
       </div>
+    </div>
+  </div>
+
+  <div id="migrationAdvisorWrap" style="max-width:1200px;margin:0 auto 1.5rem;display:none">
+    <div class="card">
+      <h3 style="margin-top:0">Migration Advisor</h3>
+      <p style="font-size:0.85rem;color:#8b949e;margin:0 0 1rem">
+        Devices past End-of-Life that have a Cisco-recommended migration path. Grouped by replacement PID to surface consolidation opportunities.
+      </p>
+      <div id="migrationAdvisorSummaryBar" class="summary-bar" style="margin-bottom:1rem"></div>
+      <div id="migrationAdvisorContent"></div>
     </div>
   </div>
 
@@ -1663,6 +1675,95 @@ function renderEoxTimeline(mode) {
       }
     }
   });
+}
+
+// ── Migration Advisor ─────────────────────────────────────────────────────────
+function toggleMigrationAdvisor() {
+  const wrap = document.getElementById('migrationAdvisorWrap');
+  if (wrap.style.display === 'none') {
+    wrap.style.display = 'block';
+    renderMigrationAdvisor();
+  } else {
+    wrap.style.display = 'none';
+  }
+}
+
+function renderMigrationAdvisor() {
+  const pidCol        = bulkHeaders.find(h => !eoxColNames.includes(h) && h !== '');
+  const complianceCol = 'EOX Compliance';
+  const migCol        = 'EOX Migration PID';
+  const migInfoKey    = null; // migration_info not stored as separate column
+
+  // Build list of EoL devices with a migration target
+  const eolDevices = bulkRows.filter(row => {
+    const comp = String(row[complianceCol] || '').toLowerCase();
+    const mig  = String(row[migCol] || '').trim();
+    return (comp.includes('noncompliant') || comp.includes('warning')) && mig;
+  });
+
+  const summaryBar = document.getElementById('migrationAdvisorSummaryBar');
+  const content    = document.getElementById('migrationAdvisorContent');
+
+  if (!eolDevices.length) {
+    summaryBar.innerHTML = '';
+    content.innerHTML = '<p style="color:#6e7681;font-size:0.85rem">No EoL / warning devices with a migration path found in the current dataset.</p>';
+    return;
+  }
+
+  // Group by migration target PID
+  const groups = {};
+  for (const row of eolDevices) {
+    const mig = String(row[migCol]).trim();
+    if (!groups[mig]) groups[mig] = [];
+    groups[mig].push(row);
+  }
+  const sortedTargets = Object.keys(groups).sort((a, b) => groups[b].length - groups[a].length);
+
+  const totalEol = eolDevices.length;
+  const uniqueTargets = sortedTargets.length;
+  summaryBar.innerHTML = `
+    <span class="pill pill-nc">${totalEol} EoL / Warning Devices</span>
+    <span class="pill pill-total">${uniqueTargets} Unique Migration Target${uniqueTargets !== 1 ? 's' : ''}</span>`;
+
+  content.innerHTML = sortedTargets.map(target => {
+    const devs = groups[target];
+    const rows = devs.map(row => {
+      const dev = pidCol ? String(row[pidCol] || '').trim() : '—';
+      const comp = String(row[complianceCol] || '');
+      const badge = eoxComplianceBadge(comp);
+      return `<tr style="border-bottom:1px solid #21262d">
+        <td style="padding:0.35rem 0.75rem;font-family:monospace;font-size:0.8rem">${dev}</td>
+        <td style="padding:0.35rem 0.75rem">${badge}</td>
+      </tr>`;
+    }).join('');
+
+    return `<div style="margin-bottom:1.25rem;border:1px solid #30363d;border-radius:6px;overflow:hidden">
+      <div style="background:#161b22;padding:0.6rem 0.75rem;display:flex;align-items:center;justify-content:space-between">
+        <div>
+          <span style="font-size:0.75rem;color:#6e7681;margin-right:0.5rem">Migrate to →</span>
+          <strong style="font-family:monospace;color:#58a6ff;font-size:0.9rem">${target}</strong>
+          <span style="font-size:0.75rem;color:#6e7681;margin-left:0.75rem">${devs.length} device${devs.length !== 1 ? 's' : ''}</span>
+        </div>
+        <div style="display:flex;gap:0.4rem">
+          <button class="btn-secondary" style="font-size:0.72rem;padding:0.2rem 0.5rem"
+            onclick="document.getElementById('pid').value='${target}';document.querySelector('.tab-btn[data-tab=single]').click();searchForm.dispatchEvent(new Event('submit'))">
+            EOX Lookup
+          </button>
+          <button class="btn-secondary" style="font-size:0.72rem;padding:0.2rem 0.5rem"
+            onclick="document.getElementById('swimPid').value='${target}';document.querySelector('.tab-btn[data-tab=swim]').click();document.getElementById('swimSearchForm').dispatchEvent(new Event('submit'))">
+            SWIM Lookup
+          </button>
+        </div>
+      </div>
+      <table style="width:100%;border-collapse:collapse;font-size:0.78rem">
+        <thead><tr style="background:#0d1117">
+          <th style="padding:0.35rem 0.75rem;text-align:left;color:#8b949e;border-bottom:1px solid #30363d">Current Device</th>
+          <th style="padding:0.35rem 0.75rem;text-align:left;color:#8b949e;border-bottom:1px solid #30363d">EOX Status</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+  }).join('');
 }
 
 // ── SWIM Single Search ────────────────────────────────────────────────────────
