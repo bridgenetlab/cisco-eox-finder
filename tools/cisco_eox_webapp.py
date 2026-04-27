@@ -33,6 +33,12 @@ import cisco_psirt
 import cisco_sn2info
 import cisco_swim
 
+try:
+    import anthropic as _anthropic_lib
+    _ANTHROPIC_AVAILABLE = True
+except ImportError:
+    _ANTHROPIC_AVAILABLE = False
+
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB
 
@@ -197,6 +203,33 @@ _ALERT_MIN_NC  = int(os.getenv("ALERT_MIN_NONCOMPLIANT", "1"))  # min non-compli
 
 def _smtp_configured() -> bool:
     return bool(_SMTP_HOST and _ALERT_TO)
+
+
+_ANTHROPIC_CLIENT = None
+
+
+def _get_anthropic_client():
+    """Lazy-init Anthropic client. Raises RuntimeError if unavailable."""
+    global _ANTHROPIC_CLIENT
+    if not _ANTHROPIC_AVAILABLE:
+        raise RuntimeError("anthropic package not installed")
+    api_key = os.getenv("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY env var not set")
+    if _ANTHROPIC_CLIENT is None:
+        _ANTHROPIC_CLIENT = _anthropic_lib.Anthropic(api_key=api_key)
+    return _ANTHROPIC_CLIENT
+
+
+_EXPLAIN_SYSTEM = (
+    "You are a senior network security engineer. When given a Cisco device config diff "
+    "result — including a numeric risk score, per-level change counts, and a list of "
+    "annotated diff entries — you produce a concise, plain-English explanation for a "
+    "network operations team. Cover: (1) the overall risk level and what is driving it, "
+    "(2) the two or three most dangerous individual changes and their real-world impact, "
+    "(3) a short recommended action (approve / review in staging / block immediately). "
+    "Be direct and specific. Use markdown bullet points. Keep the response under 350 words."
+)
 
 
 def _send_email_alert(job_type: str, stats: dict, job_id: str, subject_override: str = "") -> str | None:
@@ -1281,8 +1314,19 @@ thead th.urgency-col { color: #f0883e; }
 
   <div id="diffSummaryBar" class="summary-bar" style="display:none"></div>
 
-  <div id="diffDownloadBar" style="max-width:1200px;margin:0 auto 1rem;display:none">
+  <div id="diffDownloadBar" style="max-width:1200px;margin:0 auto 1rem;display:none;gap:0.5rem;flex-wrap:wrap">
     <a id="diffDownloadHtml" class="btn-secondary" href="#" onclick="downloadDiffReport();return false">⎙ Download HTML Report</a>
+    <button id="diffExplainBtn" class="btn-secondary" onclick="explainDiff()" style="border-color:#388bfd;color:#388bfd">💡 Explain Risk</button>
+  </div>
+  <div id="diffExplainWrap" style="max-width:1200px;margin:0 auto 1rem;display:none">
+    <div class="card" style="border-color:#388bfd44">
+      <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.75rem">
+        <span style="font-weight:700;color:#388bfd">AI Risk Explanation</span>
+        <span style="font-size:0.75rem;color:#6e7681">Powered by Claude</span>
+        <span id="diffExplainSpinner" style="display:none;color:#8b949e;font-size:0.8rem">Analyzing…</span>
+      </div>
+      <div id="diffExplainContent" style="font-size:0.85rem;line-height:1.6;white-space:pre-wrap;color:#c9d1d9"></div>
+    </div>
   </div>
 
   <div id="diffResultWrap" style="max-width:1200px;margin:0 auto 1.5rem;display:none">
@@ -3624,6 +3668,7 @@ function clearDiff() {
   document.getElementById('diffSummaryBar').style.display = 'none';
   document.getElementById('diffDownloadBar').style.display = 'none';
   document.getElementById('diffResultWrap').style.display = 'none';
+  document.getElementById('diffExplainWrap').style.display = 'none';
   _diffResult = null;
 }
 
@@ -3800,6 +3845,37 @@ td{padding:0.3rem 0.5rem;vertical-align:top}</style></head><body>
   a.href = URL.createObjectURL(blob);
   a.download = 'cisco_config_diff_report.html';
   a.click();
+}
+
+// ── AI Config Risk Explanation ────────────────────────────────────────────────
+async function explainDiff() {
+  if (!_diffResult) return;
+  const btn     = document.getElementById('diffExplainBtn');
+  const wrap    = document.getElementById('diffExplainWrap');
+  const spinner = document.getElementById('diffExplainSpinner');
+  const content = document.getElementById('diffExplainContent');
+  btn.disabled = true;
+  spinner.style.display = 'inline';
+  wrap.style.display = 'block';
+  content.textContent = '';
+  try {
+    const resp = await fetch('/config-diff/explain', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({diff_result: _diffResult})
+    });
+    const data = await resp.json();
+    if (data.error) {
+      content.textContent = '⚠ ' + data.error;
+    } else {
+      content.textContent = data.explanation || '(no explanation returned)';
+    }
+  } catch (e) {
+    content.textContent = '⚠ Request failed: ' + e;
+  } finally {
+    btn.disabled = false;
+    spinner.style.display = 'none';
+  }
 }
 
 // ── Bulk Config Diff ──────────────────────────────────────────────────────────
@@ -4732,6 +4808,65 @@ def baselines_delete(bid: str):
     if not _delete_baseline(bid):
         return jsonify({"error": "Not found"}), 404
     return jsonify({"ok": True})
+
+
+@app.route("/config-diff/explain", methods=["POST"])
+def config_diff_explain():
+    try:
+        client = _get_anthropic_client()
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 503
+
+    data = request.get_json(force=True) or {}
+    diff_result = data.get("diff_result")
+    if not diff_result:
+        return jsonify({"error": "diff_result is required"}), 400
+
+    # Build a compact summary for the user message — omit context/separator lines
+    # to keep the prompt tight.
+    summary  = diff_result.get("summary", {})
+    score    = diff_result.get("risk_score", 0)
+    changes  = [
+        c for c in (diff_result.get("changes") or [])
+        if c.get("action") not in ("context", "separator") and c.get("risk_reason")
+    ]
+    # Truncate to 80 most-risky entries so we don't blow the context window
+    risk_order = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+    changes.sort(key=lambda c: risk_order.get(c.get("risk_level", "info"), 0), reverse=True)
+    changes = changes[:80]
+
+    change_lines = "\n".join(
+        f"[{c.get('risk_level','info').upper()}] {c.get('action','?').upper()} "
+        f"line {c.get('ref_line_no') or c.get('cur_line_no','?')}: "
+        f"{(c.get('content') or '').strip()!r} — {c.get('risk_reason','')}"
+        for c in changes
+    )
+    user_msg = (
+        f"Risk Score: {score}\n"
+        f"Critical: {summary.get('critical',0)}, High: {summary.get('high',0)}, "
+        f"Medium: {summary.get('medium',0)}, Low: {summary.get('low',0)}\n"
+        f"Lines added: {summary.get('lines_added',0)}, removed: {summary.get('lines_removed',0)}\n\n"
+        f"Annotated diff entries:\n{change_lines or '(none — configurations may be identical)'}"
+    )
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            system=[
+                {
+                    "type": "text",
+                    "text": _EXPLAIN_SYSTEM,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        explanation = response.content[0].text
+    except Exception as exc:
+        return jsonify({"error": f"Claude API error: {exc}"}), 502
+
+    return jsonify({"explanation": explanation})
 
 
 @app.route("/import/netbox", methods=["POST"])
