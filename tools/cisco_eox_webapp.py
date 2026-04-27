@@ -4650,6 +4650,150 @@ def settings_test_email():
     return jsonify({"ok": True, "sent_to": _ALERT_TO})
 
 
+# ── REST API v1 ───────────────────────────────────────────────────────────────
+_API_KEY = os.getenv("API_KEY", "")
+
+
+def _api_auth() -> bool:
+    """Return True if the request is authorized (or no key configured)."""
+    if not _API_KEY:
+        return True
+    provided = (request.headers.get("X-API-Key") or
+                request.args.get("api_key") or "")
+    return provided == _API_KEY
+
+
+def _api_err(msg: str, code: int = 400):
+    return jsonify({"ok": False, "data": None, "error": msg}), code
+
+
+def _api_ok(data):
+    return jsonify({"ok": True, "data": data, "error": None})
+
+
+@app.route("/api/v1/")
+def api_index():
+    return _api_ok({
+        "version": "1",
+        "endpoints": [
+            {"method": "GET",  "path": "/api/v1/eox",         "params": ["pid", "sn"]},
+            {"method": "GET",  "path": "/api/v1/swim",        "params": ["pid"]},
+            {"method": "GET",  "path": "/api/v1/psirt",       "params": ["os_type", "version"]},
+            {"method": "GET",  "path": "/api/v1/bug",         "params": ["pid", "version (opt)"]},
+            {"method": "POST", "path": "/api/v1/config-diff", "body":  {"reference": "str", "current": "str", "min_risk": "info|low|medium|high|critical"}},
+            {"method": "GET",  "path": "/api/v1/jobs",        "params": ["limit (opt, default 20)"]},
+        ],
+        "auth": "X-API-Key header or ?api_key= query param (required when API_KEY env var is set)",
+    })
+
+
+@app.route("/api/v1/eox")
+def api_eox():
+    if not _api_auth():
+        return _api_err("Unauthorized", 401)
+    pid = request.args.get("pid", "").strip()
+    sn  = request.args.get("sn",  "").strip()
+    if not pid and not sn:
+        return _api_err("Provide 'pid' or 'sn' query parameter")
+    try:
+        if pid:
+            result = cisco_eox.query_by_product_id(pid)
+        else:
+            result = cisco_eox.query_by_serial_number(sn)
+    except Exception as exc:
+        return _api_err(str(exc), 502)
+    return _api_ok(result)
+
+
+@app.route("/api/v1/swim")
+def api_swim():
+    if not _api_auth():
+        return _api_err("Unauthorized", 401)
+    pid = request.args.get("pid", "").strip()
+    if not pid:
+        return _api_err("Provide 'pid' query parameter")
+    try:
+        result = cisco_swim.get_suggested_release(pid)
+    except Exception as exc:
+        return _api_err(str(exc), 502)
+    return _api_ok(result)
+
+
+@app.route("/api/v1/psirt")
+def api_psirt():
+    if not _api_auth():
+        return _api_err("Unauthorized", 401)
+    os_type = request.args.get("os_type", "iosxe").strip().lower()
+    version = request.args.get("version", "").strip()
+    if not version:
+        return _api_err("Provide 'version' query parameter")
+    if os_type not in cisco_psirt.OS_TYPES:
+        return _api_err(f"Invalid os_type. Valid values: {', '.join(cisco_psirt.OS_TYPES)}")
+    try:
+        result = cisco_psirt.query_psirt_by_version(os_type, version)
+    except Exception as exc:
+        return _api_err(str(exc), 502)
+    return _api_ok(result)
+
+
+@app.route("/api/v1/bug")
+def api_bug():
+    if not _api_auth():
+        return _api_err("Unauthorized", 401)
+    pid     = request.args.get("pid",     "").strip()
+    version = request.args.get("version", "").strip()
+    if not pid:
+        return _api_err("Provide 'pid' query parameter")
+    try:
+        bugs = (cisco_bug.get_bugs_by_pid_version(pid, version)
+                if version else cisco_bug.get_bugs_by_pid(pid))
+    except Exception as exc:
+        return _api_err(str(exc), 502)
+    return _api_ok({"pid": pid, "version": version, "bugs": bugs,
+                    "compliance": cisco_bug._bug_compliance(bugs)})
+
+
+@app.route("/api/v1/config-diff", methods=["POST"])
+def api_config_diff():
+    if not _api_auth():
+        return _api_err("Unauthorized", 401)
+    body      = request.get_json(force=True) or {}
+    reference = (body.get("reference") or "").strip()
+    current   = (body.get("current")   or "").strip()
+    min_risk  = (body.get("min_risk")  or "info").strip().lower()
+    if not reference or not current:
+        return _api_err("Both 'reference' and 'current' fields are required")
+    result   = cisco_config_diff.analyze_diff(
+        reference.splitlines(keepends=True),
+        current.splitlines(keepends=True),
+    )
+    min_rank = cisco_config_diff.RISK_ORDER.get(min_risk, 0)
+    result["changes"] = [
+        c for c in result["changes"]
+        if c["action"] in ("context", "separator")
+        or cisco_config_diff.RISK_ORDER.get(c["risk_level"], 0) >= min_rank
+    ]
+    return _api_ok(result)
+
+
+@app.route("/api/v1/jobs")
+def api_jobs():
+    if not _api_auth():
+        return _api_err("Unauthorized", 401)
+    import json as _json
+    limit = min(int(request.args.get("limit", 20)), 90)
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT job_id, job_type, stats_json, created_at FROM job_meta "
+            "ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return _api_ok([
+        {"job_id": r[0], "job_type": r[1],
+         "stats": _json.loads(r[2]), "created_at": r[3]}
+        for r in rows
+    ])
+
+
 if __name__ == "__main__":
     print("Cisco EOX Finder running at http://localhost:5001")
     app.run(host="0.0.0.0", port=5001, debug=False)
