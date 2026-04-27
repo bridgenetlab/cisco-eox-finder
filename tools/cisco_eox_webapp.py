@@ -57,6 +57,11 @@ def _db():
         "(job_id TEXT PRIMARY KEY, job_type TEXT NOT NULL, "
         "stats_json TEXT NOT NULL, created_at INTEGER NOT NULL)"
     )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS config_baselines "
+        "(baseline_id TEXT PRIMARY KEY, name TEXT NOT NULL, "
+        "content TEXT NOT NULL, created_at INTEGER NOT NULL)"
+    )
     conn.commit()
     return conn
 
@@ -118,6 +123,40 @@ def _delete_saved_list(list_id: str) -> bool:
     with _db() as conn:
         cur = conn.execute("DELETE FROM saved_lists WHERE list_id = ?", (list_id,))
     return cur.rowcount > 0
+
+# ── Config baselines ─────────────────────────────────────────────────────────
+def _list_baselines() -> list[dict]:
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT baseline_id, name, created_at FROM config_baselines ORDER BY created_at DESC"
+        ).fetchall()
+    return [{"baseline_id": r[0], "name": r[1], "created_at": r[2]} for r in rows]
+
+
+def _save_baseline(name: str, content: str) -> str:
+    bid = str(uuid.uuid4())[:8]
+    with _db() as conn:
+        conn.execute(
+            "INSERT INTO config_baselines (baseline_id, name, content, created_at) VALUES (?, ?, ?, ?)",
+            (bid, name, content, int(time.time())),
+        )
+    return bid
+
+
+def _load_baseline(bid: str) -> dict | None:
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT baseline_id, name, content, created_at FROM config_baselines WHERE baseline_id = ?",
+            (bid,),
+        ).fetchone()
+    return {"baseline_id": row[0], "name": row[1], "content": row[2], "created_at": row[3]} if row else None
+
+
+def _delete_baseline(bid: str) -> bool:
+    with _db() as conn:
+        cur = conn.execute("DELETE FROM config_baselines WHERE baseline_id = ?", (bid,))
+    return cur.rowcount > 0
+
 
 # ── Webhook alerts ───────────────────────────────────────────────────────────
 _WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
@@ -1137,11 +1176,15 @@ thead th.urgency-col { color: #f0883e; }
       <div>
         <label for="refConfig">Reference Config <span style="font-weight:400;color:#6e7681">(startup / baseline)</span></label>
         <textarea id="refConfig" rows="12" style="width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-family:'SF Mono','Fira Code',monospace;font-size:0.78rem;padding:0.6rem 0.75rem;resize:vertical" placeholder="Paste startup/reference config here…&#10;&#10;Or upload a file →"></textarea>
-        <div style="margin-top:0.4rem;display:flex;gap:0.5rem;align-items:center">
+        <div style="margin-top:0.4rem;display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
           <label class="btn-secondary" style="cursor:pointer;padding:0.35rem 0.75rem;font-size:0.8rem">
             📂 Upload File <input type="file" id="refConfigFile" accept=".txt,.cfg,.conf,.log" style="display:none">
           </label>
           <button class="btn-secondary" style="font-size:0.8rem;padding:0.35rem 0.75rem" onclick="loadDiffSample('ref')">Load Sample</button>
+          <select id="baselineLoadSel" style="font-size:0.8rem;padding:0.35rem 0.5rem;max-width:180px" onchange="loadBaselineIntoRef()">
+            <option value="">Load saved baseline…</option>
+          </select>
+          <button class="btn-secondary" style="font-size:0.8rem;padding:0.35rem 0.75rem" onclick="saveRefAsBaseline()">💾 Save as Baseline</button>
           <span id="refFileName" style="font-size:0.75rem;color:#6e7681"></span>
         </div>
       </div>
@@ -1244,6 +1287,19 @@ thead th.urgency-col { color: #f0883e; }
           </tr></thead>
           <tbody id="bulkDiffTbody"></tbody>
         </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Saved Baselines management card ── -->
+  <div style="max-width:1200px;margin:0 auto 1.5rem">
+    <div class="card">
+      <h3 style="margin-top:0">Saved Config Baselines</h3>
+      <p style="font-size:0.85rem;color:#8b949e;margin:0 0 1rem">
+        Named baseline configs stored on the server. Load one into the Reference pane above without re-pasting.
+      </p>
+      <div id="baselinesListWrap">
+        <p style="color:#6e7681;font-size:0.85rem">No baselines saved yet. Paste a config in the Reference pane above and click <strong>💾 Save as Baseline</strong>.</p>
       </div>
     </div>
   </div>
@@ -1853,6 +1909,86 @@ function renderMigrationAdvisor() {
     </div>`;
   }).join('');
 }
+
+// ── Saved Config Baselines ────────────────────────────────────────────────────
+let _baselines = [];
+
+async function refreshBaselines() {
+  try {
+    _baselines = await (await fetch('/config-diff/baselines')).json();
+  } catch(e) { _baselines = []; }
+
+  // Update dropdown
+  const sel = document.getElementById('baselineLoadSel');
+  sel.innerHTML = '<option value="">Load saved baseline…</option>' +
+    _baselines.map(b => `<option value="${b.baseline_id}">${b.name}</option>`).join('');
+
+  // Update management card
+  const wrap = document.getElementById('baselinesListWrap');
+  if (!_baselines.length) {
+    wrap.innerHTML = '<p style="color:#6e7681;font-size:0.85rem">No baselines saved yet. Paste a config in the Reference pane above and click <strong>💾 Save as Baseline</strong>.</p>';
+    return;
+  }
+  wrap.innerHTML = `<table style="width:100%;border-collapse:collapse;font-size:0.82rem">
+    <thead><tr style="background:#161b22">
+      <th style="text-align:left;padding:0.4rem 0.75rem;border-bottom:1px solid #30363d">Name</th>
+      <th style="text-align:left;padding:0.4rem 0.75rem;border-bottom:1px solid #30363d">Saved</th>
+      <th style="padding:0.4rem 0.75rem;border-bottom:1px solid #30363d">Actions</th>
+    </tr></thead>
+    <tbody>${_baselines.map(b => `<tr style="border-bottom:1px solid #21262d">
+      <td style="padding:0.4rem 0.75rem;font-weight:600">${b.name}</td>
+      <td style="padding:0.4rem 0.75rem;color:#6e7681;font-size:0.75rem">${new Date(b.created_at*1000).toLocaleString()}</td>
+      <td style="padding:0.4rem 0.75rem;display:flex;gap:0.4rem">
+        <button class="btn-secondary" style="font-size:0.72rem;padding:0.2rem 0.5rem"
+          onclick="loadBaselineById('${b.baseline_id}')">Load into Ref</button>
+        <button class="btn-secondary" style="font-size:0.72rem;padding:0.2rem 0.5rem;color:#f85149"
+          onclick="deleteBaseline('${b.baseline_id}')">Delete</button>
+      </td>
+    </tr>`).join('')}</tbody>
+  </table>`;
+}
+
+async function loadBaselineIntoRef() {
+  const sel = document.getElementById('baselineLoadSel');
+  if (!sel.value) return;
+  await loadBaselineById(sel.value);
+  sel.value = '';
+}
+
+async function loadBaselineById(bid) {
+  try {
+    const b = await (await fetch(`/config-diff/baselines/${bid}`)).json();
+    document.getElementById('refConfig').value = b.content;
+    document.getElementById('refFileName').textContent = `Loaded: ${b.name}`;
+  } catch(e) { alert('Failed to load baseline: ' + e.message); }
+}
+
+async function saveRefAsBaseline() {
+  const content = document.getElementById('refConfig').value.trim();
+  if (!content) { alert('Reference config pane is empty.'); return; }
+  const name = prompt('Name for this baseline:');
+  if (!name?.trim()) return;
+  try {
+    await fetch('/config-diff/baselines', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: name.trim(), content}),
+    });
+    await refreshBaselines();
+  } catch(e) { alert('Save failed: ' + e.message); }
+}
+
+async function deleteBaseline(bid) {
+  if (!confirm('Delete this baseline?')) return;
+  try {
+    await fetch(`/config-diff/baselines/${bid}`, {method: 'DELETE'});
+    await refreshBaselines();
+  } catch(e) { alert('Delete failed: ' + e.message); }
+}
+
+// Load baselines when Config Diff tab is opened
+document.querySelector('.tab-btn[data-tab="configdiff"]').addEventListener('click', refreshBaselines);
+refreshBaselines();  // also load on page init so dropdown is populated immediately
 
 // ── SWIM Single Search ────────────────────────────────────────────────────────
 const swimSearchForm   = document.getElementById('swimSearchForm');
@@ -4319,6 +4455,39 @@ def config_diff_bulk_download(job_id: str):
         download_name="cisco_bulk_config_diff.xlsx",
         as_attachment=True,
     )
+
+
+@app.route("/config-diff/baselines", methods=["GET"])
+def baselines_list():
+    return jsonify(_list_baselines())
+
+
+@app.route("/config-diff/baselines", methods=["POST"])
+def baselines_save():
+    data    = request.get_json(force=True) or {}
+    name    = (data.get("name") or "").strip()
+    content = (data.get("content") or "").strip()
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+    if not content:
+        return jsonify({"error": "content is required"}), 400
+    bid = _save_baseline(name, content)
+    return jsonify({"baseline_id": bid, "name": name})
+
+
+@app.route("/config-diff/baselines/<bid>", methods=["GET"])
+def baselines_get(bid: str):
+    b = _load_baseline(bid)
+    if b is None:
+        return jsonify({"error": "Not found"}), 404
+    return jsonify(b)
+
+
+@app.route("/config-diff/baselines/<bid>", methods=["DELETE"])
+def baselines_delete(bid: str):
+    if not _delete_baseline(bid):
+        return jsonify({"error": "Not found"}), 404
+    return jsonify({"ok": True})
 
 
 @app.route("/unified/upload", methods=["POST"])
