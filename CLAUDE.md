@@ -515,6 +515,21 @@ python cisco_eox_webapp.py    # runs on http://localhost:5001
 
 **Limits:** `MAX_CONTENT_LENGTH = 50 MB`
 
+**Optional alert env vars:**
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `WEBHOOK_URL` | — | Slack/Teams incoming webhook URL for non-compliant alerts |
+| `SMTP_HOST` | — | SMTP server hostname (required to enable email alerts) |
+| `SMTP_PORT` | `587` | SMTP port (587 = STARTTLS, 465 = SSL) |
+| `SMTP_USER` | — | SMTP login username |
+| `SMTP_PASS` | — | SMTP login password |
+| `ALERT_EMAIL_FROM` | `SMTP_USER` | Sender address |
+| `ALERT_EMAIL_TO` | — | Recipient(s), comma-separated (required to enable email alerts) |
+| `ALERT_MIN_NONCOMPLIANT` | `1` | Minimum non-compliant devices to trigger an email |
+
+Email alerts fire automatically after every bulk job (EOX / SWIM / PSIRT / Bug / Unified) when the non-compliant count meets the threshold. The Dashboard tab shows the current SMTP config and has a **✉ Send Test Email** button.
+
 ---
 
 ## Workflows Reference

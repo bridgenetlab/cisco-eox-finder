@@ -12,11 +12,14 @@ Run:
 import io
 import os
 import pickle
+import smtplib
 import sqlite3
 import sys
 import time
 import uuid
 import zipfile
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from pathlib import Path
 
 import pandas as pd
@@ -142,6 +145,71 @@ def _send_webhook_alert(job_type: str, stats: dict, job_id: str) -> None:
         _req.post(_WEBHOOK_URL, json={"text": text}, timeout=5)
     except Exception as exc:
         print(f"Webhook send failed: {exc}", file=sys.stderr)
+
+# ── Email alerts (SMTP) ──────────────────────────────────────────────────────
+_SMTP_HOST     = os.getenv("SMTP_HOST", "")
+_SMTP_PORT     = int(os.getenv("SMTP_PORT", "587"))
+_SMTP_USER     = os.getenv("SMTP_USER", "")
+_SMTP_PASS     = os.getenv("SMTP_PASS", "")
+_ALERT_FROM    = os.getenv("ALERT_EMAIL_FROM", _SMTP_USER)
+_ALERT_TO      = os.getenv("ALERT_EMAIL_TO", "")   # comma-separated
+_ALERT_MIN_NC  = int(os.getenv("ALERT_MIN_NONCOMPLIANT", "1"))  # min non-compliant to trigger
+
+
+def _smtp_configured() -> bool:
+    return bool(_SMTP_HOST and _ALERT_TO)
+
+
+def _send_email_alert(job_type: str, stats: dict, job_id: str, subject_override: str = "") -> str | None:
+    """Send an HTML email summary. Returns error string or None on success."""
+    if not _smtp_configured():
+        return "SMTP not configured"
+    non_compliant = (
+        stats.get("non_compliant") or stats.get("noncompliant")
+        or stats.get("psirt_non_compliant") or stats.get("bug_non_compliant") or 0
+    )
+    if not subject_override and non_compliant < _ALERT_MIN_NC:
+        return None  # below threshold, skip quietly
+
+    total = stats.get("total", 0)
+    label = job_type.upper()
+    subject = subject_override or f"[Cisco EOX Finder] {label} Alert — {non_compliant}/{total} Non-Compliant"
+
+    # Build HTML body
+    rows_html = "".join(
+        f"<tr><td style='padding:4px 10px;border-bottom:1px solid #30363d'>{k}</td>"
+        f"<td style='padding:4px 10px;border-bottom:1px solid #30363d;font-weight:bold'>{v}</td></tr>"
+        for k, v in stats.items() if isinstance(v, (int, float, str))
+    )
+    body = f"""<!DOCTYPE html><html><body style='font-family:sans-serif;background:#0d1117;color:#c9d1d9;padding:1.5rem'>
+<h2 style='color:#e6edf3'>{label} Job Complete — Job ID: {job_id}</h2>
+<table style='border-collapse:collapse;font-size:0.85rem;min-width:320px'>
+  <thead><tr><th style='text-align:left;padding:4px 10px;border-bottom:2px solid #30363d;color:#8b949e'>Stat</th>
+  <th style='text-align:left;padding:4px 10px;border-bottom:2px solid #30363d;color:#8b949e'>Value</th></tr></thead>
+  <tbody>{rows_html}</tbody>
+</table>
+<p style='font-size:0.78rem;color:#6e7681;margin-top:1.5rem'>Sent by Cisco EOX Finder · Job ID {job_id}</p>
+</body></html>"""
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"]    = _ALERT_FROM
+    msg["To"]      = _ALERT_TO
+    msg.attach(MIMEText(body, "html"))
+
+    try:
+        with smtplib.SMTP(_SMTP_HOST, _SMTP_PORT, timeout=10) as s:
+            s.ehlo()
+            if _SMTP_PORT != 465:
+                s.starttls()
+            if _SMTP_USER and _SMTP_PASS:
+                s.login(_SMTP_USER, _SMTP_PASS)
+            s.sendmail(_ALERT_FROM, [a.strip() for a in _ALERT_TO.split(",")], msg.as_string())
+        return None
+    except Exception as exc:
+        print(f"Email alert failed: {exc}", file=sys.stderr)
+        return str(exc)
+
 
 # ── Column-name detection ────────────────────────────────────────────────────
 PID_KEYWORDS = ["product part", "product_part", "productpart", "pid",
@@ -1215,6 +1283,26 @@ thead th.urgency-col { color: #f0883e; }
         <canvas id="dashTrendBar" height="120"></canvas>
       </div>
       <div id="dashJobTable" style="overflow-x:auto"></div>
+    </div>
+  </div>
+
+  <!-- Email alert settings card -->
+  <div class="card" style="margin-top:1.5rem">
+    <h3 style="margin-top:0">Email Alert Settings</h3>
+    <p style="font-size:0.85rem;color:#8b949e;margin:0 0 1rem">
+      Sends an HTML summary email after each bulk job when non-compliant devices are found.
+      Configure via environment variables — no restart needed after initial setup.
+    </p>
+    <div id="emailConfigDisplay" style="font-size:0.82rem;margin-bottom:1rem"></div>
+    <div style="display:flex;gap:0.5rem;align-items:center">
+      <button class="btn-secondary" onclick="sendTestEmail()">✉ Send Test Email</button>
+      <span id="emailTestStatus" class="status-msg"></span>
+    </div>
+    <div style="margin-top:1rem;padding:0.75rem;background:#0d1117;border-radius:6px;border:1px solid #21262d;font-size:0.78rem;color:#6e7681">
+      <strong style="color:#8b949e">Required env vars:</strong><br>
+      <code>SMTP_HOST</code>, <code>SMTP_PORT</code> (default 587), <code>SMTP_USER</code>, <code>SMTP_PASS</code>,
+      <code>ALERT_EMAIL_FROM</code>, <code>ALERT_EMAIL_TO</code> (comma-separated),
+      <code>ALERT_MIN_NONCOMPLIANT</code> (default 1)
     </div>
   </div>
 </div>
@@ -2636,7 +2724,10 @@ loadSavedLists();
 // ── Compliance Dashboard ──────────────────────────────────────────────────────
 let _dashCharts = {};
 
-document.querySelector('.tab-btn[data-tab="dashboard"]').addEventListener('click', loadDashboard);
+document.querySelector('.tab-btn[data-tab="dashboard"]').addEventListener('click', () => {
+  loadDashboard();
+  loadEmailConfig();
+});
 
 async function loadDashboard() {
   try {
@@ -2645,6 +2736,39 @@ async function loadDashboard() {
     renderDashboard(jobs);
   } catch(e) {
     document.getElementById('dashboardEmpty').textContent = 'Failed to load dashboard data.';
+  }
+}
+
+async function loadEmailConfig() {
+  try {
+    const cfg = await (await fetch('/settings/email-config')).json();
+    const el = document.getElementById('emailConfigDisplay');
+    if (cfg.configured) {
+      el.innerHTML = `
+        <div style="display:flex;flex-wrap:wrap;gap:0.5rem">
+          <span class="pill pill-c">Configured</span>
+          <span class="pill pill-total">Host: ${cfg.smtp_host}:${cfg.smtp_port}</span>
+          <span class="pill pill-total">From: ${cfg.alert_from||'(not set)'}</span>
+          <span class="pill pill-total">To: ${cfg.alert_to}</span>
+          <span class="pill pill-total">Min NC: ${cfg.min_noncompliant}</span>
+        </div>`;
+    } else {
+      el.innerHTML = '<span class="pill pill-uk">Not configured — set SMTP_HOST and ALERT_EMAIL_TO env vars</span>';
+    }
+  } catch(e) { /* silent */ }
+}
+
+async function sendTestEmail() {
+  const statusEl = document.getElementById('emailTestStatus');
+  statusEl.textContent = 'Sending…';
+  try {
+    const resp = await fetch('/settings/test-email', { method: 'POST' });
+    const data = await resp.json();
+    statusEl.textContent = data.ok
+      ? `✓ Test email sent to ${data.sent_to}`
+      : `✗ ${data.error}`;
+  } catch(e) {
+    statusEl.textContent = 'Error: ' + e.message;
   }
 }
 
@@ -3588,6 +3712,7 @@ def upload():
     job_id = str(uuid.uuid4())[:8]
     _store_job(job_id, df)
     _send_webhook_alert("eox", stats, job_id)
+    _send_email_alert("eox", stats, job_id)
     _record_job_meta(job_id, "eox", stats)
 
     # Return rows as list of dicts
@@ -3792,6 +3917,7 @@ def swim_upload():
     job_id = str(uuid.uuid4())[:8]
     _store_job(job_id, df)
     _send_webhook_alert("swim", stats, job_id)
+    _send_email_alert("swim", stats, job_id)
     _record_job_meta(job_id, "swim", stats)
 
     return jsonify({
@@ -3906,6 +4032,7 @@ def psirt_upload():
     job_id = str(uuid.uuid4())[:8]
     _store_job(job_id, df)
     _send_webhook_alert("psirt", stats, job_id)
+    _send_email_alert("psirt", stats, job_id)
     _record_job_meta(job_id, "psirt", stats)
 
     return jsonify({
@@ -4022,6 +4149,7 @@ def bug_upload():
     _store_job(job_id, df)
     _record_job_meta(job_id, "bug", stats)
     _send_webhook_alert("bug", stats, job_id)
+    _send_email_alert("bug", stats, job_id)
 
     return jsonify({
         "job_id":        job_id,
@@ -4412,6 +4540,7 @@ def unified_upload():
     job_id = str(uuid.uuid4())[:8]
     _store_job(job_id, df)
     _send_webhook_alert("unified", stats, job_id)
+    _send_email_alert("unified", stats, job_id)
     _record_job_meta(job_id, "unified", stats)
 
     return jsonify({
@@ -4491,6 +4620,34 @@ def delete_list(list_id: str):
     if not _delete_saved_list(list_id):
         return jsonify({"error": "Not found"}), 404
     return jsonify({"ok": True})
+
+
+@app.route("/settings/email-config")
+def settings_email_config():
+    return jsonify({
+        "smtp_host":    _SMTP_HOST or None,
+        "smtp_port":    _SMTP_PORT,
+        "smtp_user":    _SMTP_USER or None,
+        "alert_to":     _ALERT_TO  or None,
+        "alert_from":   _ALERT_FROM or None,
+        "min_noncompliant": _ALERT_MIN_NC,
+        "configured":   _smtp_configured(),
+    })
+
+
+@app.route("/settings/test-email", methods=["POST"])
+def settings_test_email():
+    if not _smtp_configured():
+        return jsonify({"ok": False, "error": "SMTP_HOST and ALERT_EMAIL_TO env vars are required"}), 400
+    err = _send_email_alert(
+        "test",
+        {"total": 1, "non_compliant": 1, "note": "This is a test alert from Cisco EOX Finder"},
+        "TEST",
+        subject_override="[Cisco EOX Finder] Test Email — Configuration Verified",
+    )
+    if err:
+        return jsonify({"ok": False, "error": err}), 500
+    return jsonify({"ok": True, "sent_to": _ALERT_TO})
 
 
 if __name__ == "__main__":
